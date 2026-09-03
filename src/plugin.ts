@@ -128,36 +128,65 @@ export class BatchOpenPlugin {
       },
       label: string,
     ): void => {
-      ctx.menuElem?.setAttribute("label", label);
-      const items = ctx.items;
-      let enabled = true;
-      if (Array.isArray(items)) {
-        enabled =
-          items.length > 0 && items.some((item) => item.isRegularItem());
+      // ctx is supplied by Zotero and its shape varies across Zotero 8-10;
+      // every member is treated as possibly absent and this must never throw
+      // or return a rejected promise, or the item context menu breaks.
+      try {
+        ctx?.menuElem?.setAttribute?.("label", label);
+      } catch (error) {
+        this.log(`contextShowing: failed to set label: ${error}`);
       }
-      ctx.setEnabled?.(enabled);
+
+      try {
+        const items = ctx?.items;
+        let enabled = true;
+        if (Array.isArray(items)) {
+          enabled =
+            items.length > 0 && items.some((item) => item?.isRegularItem?.());
+        }
+        ctx?.setEnabled?.(enabled);
+      } catch (error) {
+        this.log(`contextShowing: failed to set enabled state: ${error}`);
+      }
     };
 
-    const actionMenus: Zotero.MenuManager.MenuData[] =
-      LIBRARY_ITEM_MENU_L10N_IDS.map((l10nID, i) => ({
-        menuType: "menuitem" as const,
-        l10nID,
-        onShowing: (_e, ctx) => {
+    const safeOnShowing = (
+      label: string,
+    ): Zotero.MenuManager.MenuData["onShowing"] => {
+      return (_event, ctx) => {
+        try {
           contextShowing(
             ctx as {
               menuElem?: Element;
               setEnabled?: (enabled: boolean) => void;
               items?: Zotero.Item[];
             },
-            LIBRARY_ITEM_MENU_LABELS[i],
+            label,
           );
-        },
+        } catch (error) {
+          this.log(`onShowing handler failed: ${error}`);
+        }
+      };
+    };
+
+    const actionMenus: Zotero.MenuManager.MenuData[] =
+      LIBRARY_ITEM_MENU_L10N_IDS.map((l10nID, i) => ({
+        menuType: "menuitem" as const,
+        l10nID,
+        onShowing: safeOnShowing(LIBRARY_ITEM_MENU_LABELS[i]),
         onCommand: () => {
-          void this.runCommand(commands[i]).catch((err: unknown) => {
-            this.log(
-              `Menu command failed: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
+          try {
+            void this.runCommand(commands[i]).catch((err: unknown) => {
+              this.log(
+                `Menu command failed: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            });
+          } catch (error) {
+            // runCommand is an async function and cannot throw
+            // synchronously, but this guards against any future refactor
+            // that breaks that guarantee.
+            this.log(`onCommand handler failed synchronously: ${error}`);
+          }
         },
       }));
 
@@ -165,16 +194,7 @@ export class BatchOpenPlugin {
       {
         menuType: "submenu",
         l10nID: LIBRARY_ITEM_SUBMENU_L10N_ID,
-        onShowing: (_e, ctx) => {
-          contextShowing(
-            ctx as {
-              menuElem?: Element;
-              setEnabled?: (enabled: boolean) => void;
-              items?: Zotero.Item[];
-            },
-            SUBMENU_LABEL,
-          );
-        },
+        onShowing: safeOnShowing(SUBMENU_LABEL),
         menus: actionMenus,
       },
     ];

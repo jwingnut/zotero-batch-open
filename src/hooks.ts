@@ -1,5 +1,6 @@
 import pkg from "../package.json";
 import { BatchOpenPlugin } from "./plugin";
+import { registerWindowFluent } from "@/utils/locale";
 
 async function onStartup(): Promise<void> {
   await Promise.all([
@@ -42,6 +43,7 @@ async function onStartup(): Promise<void> {
 }
 
 async function onMainWindowLoad(win: Window): Promise<void> {
+  registerWindowFluent(win);
   await addon.data.plugin?.onMainWindowReady(win);
 }
 

@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { BatchOpenPlugin } from "@/plugin";
 import { LIBRARY_ITEM_MENU_LABELS } from "@/constants/Menus";
 
+type MenuHandler = (event: unknown, ctx: unknown) => void;
+
 type MenuRegisterCall = {
   menuID: string;
   pluginID: string;
@@ -9,8 +11,14 @@ type MenuRegisterCall = {
   menus: Array<{
     menuType: string;
     l10nID?: string;
-    onShowing?: unknown;
-    menus?: Array<{ menuType: string; l10nID?: string; onShowing?: unknown }>;
+    onShowing?: MenuHandler;
+    onCommand?: MenuHandler;
+    menus?: Array<{
+      menuType: string;
+      l10nID?: string;
+      onShowing?: MenuHandler;
+      onCommand?: MenuHandler;
+    }>;
   }>;
 };
 
@@ -103,6 +111,84 @@ describe("MenuRegistration (Zotero 8+ MenuManager)", () => {
     const calls = getMenuRegisterCalls();
     expect(calls).toHaveLength(1);
     expect(calls[0].menuID).toBe("batch-open-main-library-item-actions");
+  });
+
+  it("onShowing does not throw when called with an empty or partial context object", async () => {
+    const plugin = new BatchOpenPlugin();
+    await plugin.init({
+      id: "batch-open@jwhitney",
+      version: "0.1.0",
+      rootURI: "",
+    });
+
+    const calls = getMenuRegisterCalls();
+    const root = calls[0].menus[0];
+    const action = (root.menus ?? [])[0];
+
+    // Zotero 8-10 may omit menuElem, setEnabled, and items entirely.
+    expect(() => root.onShowing?.({}, {})).not.toThrow();
+    expect(() => root.onShowing?.({}, undefined)).not.toThrow();
+    expect(() => action.onShowing?.({}, {})).not.toThrow();
+    expect(() =>
+      action.onShowing?.(
+        {},
+        { menuElem: undefined, setEnabled: undefined, items: undefined },
+      ),
+    ).not.toThrow();
+    // A menuElem without setAttribute, or setEnabled that throws, must also
+    // not propagate.
+    expect(() =>
+      action.onShowing?.(
+        {},
+        {
+          menuElem: {},
+          setEnabled: () => {
+            throw new Error("boom");
+          },
+          items: [],
+        },
+      ),
+    ).not.toThrow();
+  });
+
+  it("onCommand swallows and logs a synchronous throw from runCommand", async () => {
+    const plugin = new BatchOpenPlugin() as unknown as {
+      runCommand: (kind: string) => Promise<void>;
+    };
+    // Simulate a future regression where runCommand throws synchronously
+    // instead of rejecting (e.g. a non-async refactor).
+    plugin.runCommand = () => {
+      throw new Error("synchronous boom");
+    };
+
+    await (plugin as unknown as BatchOpenPlugin).init({
+      id: "batch-open@jwhitney",
+      version: "0.1.0",
+      rootURI: "",
+    });
+
+    const calls = getMenuRegisterCalls();
+    const action = (calls[0].menus[0].menus ?? [])[0];
+
+    expect(() => action.onCommand?.({}, {})).not.toThrow();
+  });
+
+  it("does not double-register when both the MenuManager and legacy paths are attempted", async () => {
+    const plugin = new BatchOpenPlugin();
+    await plugin.init({
+      id: "batch-open@jwhitney",
+      version: "0.1.0",
+      rootURI: "",
+    });
+
+    // hasNewMenuAPI() is true in this environment (Zotero.MenuManager mock
+    // is present), so onMainWindowReady must take the MenuManager branch
+    // only, never falling through to the legacy XUL path as well.
+    const win = { ZoteroPane: {} } as unknown as Window;
+    await plugin.onMainWindowReady(win);
+    await plugin.onMainWindowReady(win);
+
+    expect(getMenuRegisterCalls()).toHaveLength(1);
   });
 });
 
