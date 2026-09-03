@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+  "name": "Batch Open",
+  "version": "0.1.0",
+  "description": "Open or search the selected items in your browser, in bulk.",
+  "author": "Jason Whitney",
+  "applications": {
+    "zotero": {
+      "id": "batch-open@jwhitney",
+      "strict_min_version": "8.0",
+      "strict_max_version": "10.*"
+    }
+  }
+}

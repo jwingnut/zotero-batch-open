@@ -1,0 +1,274 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { BatchOpenPlugin } from "@/plugin";
+import { LIBRARY_ITEM_MENU_LABELS } from "@/constants/Menus";
+
+type MenuRegisterCall = {
+  menuID: string;
+  pluginID: string;
+  target: string;
+  menus: Array<{
+    menuType: string;
+    l10nID?: string;
+    onShowing?: unknown;
+    menus?: Array<{ menuType: string; l10nID?: string; onShowing?: unknown }>;
+  }>;
+};
+
+function getMenuRegisterCalls(): MenuRegisterCall[] {
+  return (
+    (globalThis as { __menuManagerRegisterCalls?: MenuRegisterCall[] })
+      .__menuManagerRegisterCalls ?? []
+  );
+}
+
+function getMenuUnregisterCalls(): string[] {
+  return (
+    (globalThis as { __menuManagerUnregisterCalls?: string[] })
+      .__menuManagerUnregisterCalls ?? []
+  );
+}
+
+describe("MenuRegistration (Zotero 8+ MenuManager)", () => {
+  it("calls registerMenu with menuID, pluginID, target, and menu items with onShowing labels", async () => {
+    const plugin = new BatchOpenPlugin();
+    await plugin.init({
+      id: "batch-open@jwhitney",
+      version: "0.1.0",
+      rootURI: "",
+    });
+
+    const calls = getMenuRegisterCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].menuID).toBe("batch-open-main-library-item-actions");
+    expect(calls[0].pluginID).toBe("batch-open@jwhitney");
+    expect(calls[0].target).toBe("main/library/item");
+    expect(calls[0].menus).toHaveLength(1);
+
+    const root = calls[0].menus[0];
+    expect(root.menuType).toBe("submenu");
+    expect(root.l10nID).toBe("batchopen-submenu");
+    expect(typeof root.onShowing).toBe("function");
+
+    const actions = root.menus ?? [];
+    expect(actions).toHaveLength(3);
+    expect(actions.every((m) => m.menuType === "menuitem")).toBe(true);
+    expect(actions.every((m) => typeof m.onShowing === "function")).toBe(true);
+    expect(actions.map((m) => m.l10nID)).toEqual([
+      "batchopen-menu-open-browser",
+      "batchopen-menu-search-scholar",
+      "batchopen-menu-search-web",
+    ]);
+    expect(LIBRARY_ITEM_MENU_LABELS).toEqual([
+      "Open all in browser",
+      "Search all in Google Scholar",
+      "Search all in web search",
+    ]);
+  });
+
+  it("shutdown does not call unregisterMenu (Zotero clears plugin menus on addon shutdown)", async () => {
+    const plugin = new BatchOpenPlugin();
+    await plugin.init({
+      id: "batch-open@jwhitney",
+      version: "0.1.0",
+      rootURI: "",
+    });
+    await plugin.shutdown();
+
+    expect(getMenuUnregisterCalls()).toEqual([]);
+  });
+
+  it("completes init when registerMenu returns false", async () => {
+    const original = Zotero.MenuManager.registerMenu;
+    Zotero.MenuManager.registerMenu = () => false;
+
+    const plugin = new BatchOpenPlugin();
+    await expect(
+      plugin.init({ id: "batch-open@jwhitney", version: "0.1.0", rootURI: "" }),
+    ).resolves.toBeUndefined();
+
+    Zotero.MenuManager.registerMenu = original;
+  });
+
+  it("does not register the same MenuManager menu twice on main window ready", async () => {
+    const plugin = new BatchOpenPlugin();
+    await plugin.init({
+      id: "batch-open@jwhitney",
+      version: "0.1.0",
+      rootURI: "",
+    });
+
+    const win = { ZoteroPane: {} } as unknown as Window;
+    await plugin.onMainWindowReady(win);
+
+    const calls = getMenuRegisterCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].menuID).toBe("batch-open-main-library-item-actions");
+  });
+});
+
+// --- Minimal fake DOM, just enough to exercise the legacy XUL menu path
+// without a jsdom dependency (vitest's environment here is "node"). ---
+
+class FakeElement {
+  tagName: string;
+  attrs = new Map<string, string>();
+  children: FakeElement[] = [];
+  listeners = new Map<string, Array<() => void>>();
+  parent: FakeElement | null = null;
+  ownerDoc: FakeDocument | null = null;
+
+  constructor(tagName: string) {
+    this.tagName = tagName;
+  }
+
+  get id(): string {
+    return this.attrs.get("id") ?? "";
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attrs.set(name, value);
+  }
+
+  getAttribute(name: string): string | null {
+    return this.attrs.get(name) ?? null;
+  }
+
+  addEventListener(type: string, handler: () => void): void {
+    const list = this.listeners.get(type) ?? [];
+    list.push(handler);
+    this.listeners.set(type, list);
+  }
+
+  dispatch(type: string): void {
+    for (const handler of this.listeners.get(type) ?? []) {
+      handler();
+    }
+  }
+
+  appendChild(child: FakeElement): void {
+    child.parent = this;
+    this.children.push(child);
+  }
+
+  remove(): void {
+    if (this.parent) {
+      this.parent.children = this.parent.children.filter((c) => c !== this);
+      this.parent = null;
+    }
+    this.ownerDoc?.unindexTree(this);
+  }
+}
+
+class FakeDocument {
+  private byId = new Map<string, FakeElement>();
+
+  createXULElement(tagName: string): FakeElement {
+    const el = new FakeElement(tagName);
+    el.ownerDoc = this;
+    return el;
+  }
+
+  createElementNS(_ns: string, tagName: string): FakeElement {
+    const el = new FakeElement(tagName);
+    el.ownerDoc = this;
+    return el;
+  }
+
+  getElementById(id: string): FakeElement | null {
+    return this.byId.get(id) ?? null;
+  }
+
+  /** Test helper: index an element (and its descendants) by id after building the tree. */
+  index(el: FakeElement): void {
+    if (el.id) {
+      this.byId.set(el.id, el);
+    }
+    for (const child of el.children) {
+      this.index(child);
+    }
+  }
+
+  unindexTree(el: FakeElement): void {
+    if (el.id) {
+      this.byId.delete(el.id);
+    }
+    for (const child of el.children) {
+      this.unindexTree(child);
+    }
+  }
+}
+
+describe("MenuRegistration (legacy XUL fallback)", () => {
+  let originalMenuManager: typeof Zotero.MenuManager;
+
+  beforeEach(() => {
+    originalMenuManager = Zotero.MenuManager;
+    // Simulate a Zotero build without the MenuManager API.
+    (Zotero as unknown as { MenuManager?: unknown }).MenuManager = undefined;
+  });
+
+  afterEach(() => {
+    Zotero.MenuManager = originalMenuManager;
+  });
+
+  it("injects a XUL submenu with three menu items into zotero-itemmenu", async () => {
+    const fakeDoc = new FakeDocument();
+    const parent = new FakeElement("menupopup");
+    parent.setAttribute("id", "zotero-itemmenu");
+    fakeDoc.index(parent);
+
+    // The plugin looks up the parent via doc.getElementById and appends to
+    // it directly; index each newly created child as it's appended so
+    // getElementById can find it (mimicking a live DOM).
+    const originalAppendChild = parent.appendChild.bind(parent);
+    parent.appendChild = (child: FakeElement) => {
+      originalAppendChild(child);
+      fakeDoc.index(child);
+    };
+
+    const win = {
+      ZoteroPane: {},
+      document: fakeDoc as unknown as Document,
+    } as unknown as Window;
+
+    // shutdown() removes menus via Zotero.getMainWindows(), so the fake
+    // window needs to be discoverable there too (mirrors the real bootstrap
+    // flow, where Zotero tracks open main windows itself).
+    const originalGetMainWindows = Zotero.getMainWindows;
+    Zotero.getMainWindows = () => [win];
+
+    const plugin = new BatchOpenPlugin();
+    await plugin.init({
+      id: "batch-open@jwhitney",
+      version: "0.1.0",
+      rootURI: "",
+    });
+    await plugin.onMainWindowReady(win);
+
+    const menu = fakeDoc.getElementById("zotero-itemmenu-batch-open-menu");
+    expect(menu).not.toBeNull();
+    expect(menu?.getAttribute("label")).toBe("Batch Open");
+
+    const items = [
+      "zotero-itemmenu-batch-open-open-browser",
+      "zotero-itemmenu-batch-open-search-scholar",
+      "zotero-itemmenu-batch-open-search-web",
+    ].map((id) => fakeDoc.getElementById(id));
+    expect(items.every((el) => el !== null)).toBe(true);
+    expect(items.map((el) => el?.getAttribute("label"))).toEqual([
+      "Open all in browser",
+      "Search all in Google Scholar",
+      "Search all in web search",
+    ]);
+
+    // No MenuManager registration should have happened on this path.
+    expect(getMenuRegisterCalls()).toEqual([]);
+
+    await plugin.shutdown();
+    expect(
+      fakeDoc.getElementById("zotero-itemmenu-batch-open-menu"),
+    ).toBeNull();
+
+    Zotero.getMainWindows = originalGetMainWindows;
+  });
+});

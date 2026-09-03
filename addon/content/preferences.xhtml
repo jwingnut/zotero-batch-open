@@ -1,0 +1,69 @@
+<vbox
+  xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+  xmlns:html="http://www.w3.org/1999/xhtml"
+  onload=""
+>
+  <groupbox>
+    <label><html:h2>Batch Open</html:h2></label>
+
+    <label value="When an item has no usable URL:" />
+    <radiogroup preference="extensions.zotero.batchopen.fallback">
+      <radio value="scholar" label="Search Google Scholar" />
+      <radio value="web" label="Search the web (using the template below)" />
+      <radio value="none" label="Skip the item" />
+    </radiogroup>
+    <description class="tip">
+      Applies only to "Open all in browser." The two search commands always
+      search, regardless of this setting.
+    </description>
+
+    <hbox align="center">
+      <label value="Web search template:" control="batchopen-pref-template" />
+      <html:input
+        id="batchopen-pref-template"
+        type="text"
+        style="flex: 1"
+        preference="extensions.zotero.batchopen.searchTemplate"
+        placeholder="https://www.google.com/search?q={query}"
+      />
+    </hbox>
+    <description class="tip">
+      Must be an http(s) URL containing the literal text {query}, which is
+      replaced with the URL-encoded search terms. An invalid template falls back
+      to the default with a warning.
+    </description>
+
+    <hbox align="center">
+      <label
+        value="Confirm before opening more than:"
+        control="batchopen-pref-confirm"
+      />
+      <html:input
+        id="batchopen-pref-confirm"
+        type="number"
+        min="1"
+        max="1000"
+        preference="extensions.zotero.batchopen.confirmAbove"
+      />
+      <label value="items" />
+    </hbox>
+    <description class="tip">
+      A confirmation prompt names the exact number of tabs before they open.
+    </description>
+
+    <hbox align="center">
+      <label value="Delay between tabs (ms):" control="batchopen-pref-delay" />
+      <html:input
+        id="batchopen-pref-delay"
+        type="number"
+        min="0"
+        max="10000"
+        preference="extensions.zotero.batchopen.delayMs"
+      />
+    </hbox>
+    <description class="tip">
+      Staggers opening so a large batch does not arrive all at once (and so
+      Google Scholar does not serve a CAPTCHA).
+    </description>
+  </groupbox>
+</vbox>

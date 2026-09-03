@@ -1,0 +1,60 @@
+{
+  "name": "zotero-batch-open",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Open or search the selected items in your browser, in bulk.",
+  "config": {
+    "addonName": "Batch Open",
+    "addonID": "batch-open@jwhitney",
+    "addonRef": "batch-open",
+    "addonInstance": "BatchOpen",
+    "prefsPrefix": "extensions.zotero.batchopen"
+  },
+  "author": "Jason Whitney",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jwhitney/zotero-batch-open.git"
+  },
+  "scripts": {
+    "start": "zotero-plugin serve",
+    "build": "zotero-plugin build && tsc --noEmit",
+    "build:dev": "zotero-plugin build --dev",
+    "lint:check": "prettier --check . && eslint .",
+    "lint:fix": "prettier --write . && eslint . --fix",
+    "test": "vitest run",
+    "test:watch": "vitest --watch",
+    "test:coverage": "vitest --coverage",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zotero-plugin-toolkit": "^5.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.25.1",
+    "@types/node": "^22.15.29",
+    "@vitest/coverage-v8": "^1.0.0",
+    "eslint": "^9.28.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.33.0",
+    "vitest": "^1.0.0",
+    "zotero-plugin-scaffold": "^0.8.5",
+    "zotero-types": "^4.0.0"
+  },
+  "prettier": {
+    "printWidth": 80,
+    "tabWidth": 2,
+    "endOfLine": "lf",
+    "overrides": [
+      {
+        "files": [
+          "*.xhtml"
+        ],
+        "options": {
+          "htmlWhitespaceSensitivity": "css"
+        }
+      }
+    ]
+  }
+}
