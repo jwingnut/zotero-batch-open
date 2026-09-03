@@ -45,6 +45,7 @@ export const DEFAULT_BATCH_SIZE = 25;
 const QUEUE_PATH = "/batchopen/queue";
 const RESULT_PATH = "/batchopen/result";
 const STATUS_PATH = "/batchopen/status";
+const CONFIRM_PATH = "/batchopen/confirm";
 
 export interface ResultPayload {
   jobId: string;
@@ -116,6 +117,7 @@ export function registerEndpointsOnRegistry(
     registry[QUEUE_PATH] = QueueEndpoint;
     registry[RESULT_PATH] = ResultEndpoint;
     registry[STATUS_PATH] = StatusEndpoint;
+    registry[CONFIRM_PATH] = ConfirmEndpoint;
   } catch (error) {
     return {
       registered: false,
@@ -126,10 +128,11 @@ export function registerEndpointsOnRegistry(
   const queueOk = registry[QUEUE_PATH] === QueueEndpoint;
   const resultOk = registry[RESULT_PATH] === ResultEndpoint;
   const statusOk = registry[STATUS_PATH] === StatusEndpoint;
-  if (!queueOk || !resultOk || !statusOk) {
+  const confirmOk = registry[CONFIRM_PATH] === ConfirmEndpoint;
+  if (!queueOk || !resultOk || !statusOk || !confirmOk) {
     return {
       registered: false,
-      reason: `read-back mismatch (queue=${queueOk}, result=${resultOk}, status=${statusOk}); another plugin may have overwritten the same path`,
+      reason: `read-back mismatch (queue=${queueOk}, result=${resultOk}, status=${statusOk}, confirm=${confirmOk}); another plugin may have overwritten the same path`,
     };
   }
 
@@ -168,7 +171,7 @@ export function registerQueueServer(): void {
   }
 
   log(
-    `Registered ${QUEUE_PATH}, ${RESULT_PATH}, and ${STATUS_PATH} on Zotero.Server.Endpoints.`,
+    `Registered ${QUEUE_PATH}, ${RESULT_PATH}, ${STATUS_PATH}, and ${CONFIRM_PATH} on Zotero.Server.Endpoints.`,
   );
   log(
     "Registration succeeded; awaiting the first poll from the browser connector. " +
@@ -214,15 +217,27 @@ export const QueueEndpoint = function (this: unknown) {} as unknown as {
 export function extractMaxParam(
   options: QueueEndpointOptions,
 ): string | undefined {
-  const query = options?.query;
+  return extractQueryParam(options?.query, "max");
+}
+
+/**
+ * General-purpose version of the query-parsing tolerance documented above,
+ * for any single-valued query parameter (e.g. CONFIRM_PATH's "jobId"). See
+ * extractMaxParam's original comment (still accurate) for why this is this
+ * defensive about the shape of `query`.
+ */
+export function extractQueryParam(
+  query: unknown,
+  key: string,
+): string | undefined {
   if (query === undefined || query === null) {
     return undefined;
   }
 
-  // A raw query string, e.g. "max=1" or "?max=1".
+  // A raw query string, e.g. "jobId=job_1" or "?jobId=job_1".
   if (typeof query === "string") {
     const stripped = query.startsWith("?") ? query.slice(1) : query;
-    const value = new URLSearchParams(stripped).get("max");
+    const value = new URLSearchParams(stripped).get(key);
     return value === null ? undefined : value;
   }
 
@@ -231,7 +246,7 @@ export function extractMaxParam(
     typeof query === "object" &&
     typeof (query as { get?: unknown }).get === "function"
   ) {
-    const value = (query as URLSearchParams).get("max");
+    const value = (query as URLSearchParams).get(key);
     return value === null || value === undefined ? undefined : String(value);
   }
 
@@ -240,9 +255,9 @@ export function extractMaxParam(
   // (e.g. from a repeated query parameter; the first value wins).
   if (typeof query === "object") {
     const record = query as Record<string, unknown>;
-    let value: unknown = record.max;
+    let value: unknown = record[key];
     if (value === undefined) {
-      value = record["?max"];
+      value = record[`?${key}`];
     }
     if (Array.isArray(value)) {
       value = value[0];
@@ -729,6 +744,135 @@ ResultEndpoint.prototype = {
         500,
         "application/json",
         JSON.stringify({ error: String(error) }),
+      ];
+    }
+  },
+};
+
+// ---------------------------------------------------------------------
+// GET /batchopen/confirm?jobId=...
+// ---------------------------------------------------------------------
+//
+// The connector's own read of whether a save "succeeded" is the resolved
+// value of a cross-context message round trip (background page -> content
+// script -> Zotero.Connector.callMethod("saveItems", ...)) relayed back
+// through browser.tabs.sendMessage(). That channel can be torn down
+// silently -- the tab navigating, the extension's messaging.js swallowing
+// a broken-port error and resolving to `undefined` (see
+// zotero-connectors' src/common/messaging.js sendMessage()'s bare
+// `catch (e) {}`), or (proven against a real Chrome MV3 build, see
+// batchOpenQueue.js's own header comment) the service worker being evicted
+// mid-await -- without ever throwing on the connector side. A job whose
+// "translate" message resolved to nothing has historically been reported
+// as `ok: true` with an empty saved-items list, which is exactly
+// indistinguishable, from the plugin side, from a real success with zero
+// reported keys.
+//
+// This endpoint lets the connector ask the one party that actually knows:
+// Zotero itself. It reuses the same duplicate-matching (DOI, then
+// PMID/arXiv, then title+year -- see reconcile.ts/duplicateMatch.ts) the
+// background reconciliation already runs, scoped to items added at or
+// after the job's enqueue time, so it works even when the connector never
+// reported a savedItemKeys value at all -- which is the exact failure mode
+// this exists to catch.
+
+export interface ConfirmDeps {
+  items: ResultItemLookup;
+  findDuplicate(
+    original: ZoteroItemLike,
+    windowStartMs: number,
+  ): FoundDuplicate | null | Promise<FoundDuplicate | null>;
+}
+
+export interface ConfirmOutcome {
+  found: boolean;
+  itemKey?: string;
+  reason?: string;
+}
+
+/**
+ * The confirm-handling logic, factored out from the Zotero.Server.Endpoint
+ * wrapper so it's unit-testable against fakes (mirrors applyResult()
+ * above).
+ */
+export async function checkConfirm(
+  jobId: string | undefined,
+  deps: ConfirmDeps,
+): Promise<ConfirmOutcome> {
+  if (!jobId) {
+    return { found: false, reason: "missing jobId" };
+  }
+
+  const job = jobQueue.get(jobId);
+  if (!job) {
+    // Same non-error treatment as an unknown jobId on POST /batchopen/result
+    // (the queue may have been cleared, or the job already reclaimed) --
+    // the connector treats "not found" the same as "not confirmed yet"
+    // either way, so this is informational, not an error status.
+    return { found: false, reason: `unknown jobId ${jobId}` };
+  }
+
+  const original = deps.items.getByLibraryAndKey(job.libraryID, job.itemKey);
+  if (!original) {
+    return {
+      found: false,
+      reason: `original item not found for itemKey=${job.itemKey}`,
+    };
+  }
+
+  // job.enqueuedAtMs, not handedOutAtMs: the job existed (and so did the
+  // original item) before either -- using the earlier, always-defined
+  // timestamp as the window start can only ever be more permissive, never
+  // miss a genuine save. Matches reconcileInBackground()'s own window.
+  const found = await deps.findDuplicate(original, job.enqueuedAtMs);
+  if (!found) {
+    return { found: false };
+  }
+  return { found: true, itemKey: found.item.key };
+}
+
+function liveConfirmDeps(): ConfirmDeps {
+  const ZoteroItems = Zotero.Items as unknown as ResultItemLookup;
+  return {
+    items: ZoteroItems,
+    findDuplicate: liveFindDuplicate,
+  };
+}
+
+export const ConfirmEndpoint = function (this: unknown) {} as unknown as {
+  new (): {
+    init: (
+      options: ConfirmEndpointOptions,
+    ) => Promise<[number, string, string]>;
+  };
+};
+
+export interface ConfirmEndpointOptions {
+  query?: unknown;
+}
+
+ConfirmEndpoint.prototype = {
+  supportedMethods: ["GET"],
+  permitBookmarklet: false,
+
+  init: async function (
+    options: ConfirmEndpointOptions,
+  ): Promise<[number, string, string]> {
+    try {
+      const jobId = extractQueryParam(options?.query, "jobId");
+      const outcome = await checkConfirm(jobId, liveConfirmDeps());
+      log(
+        `GET ${CONFIRM_PATH} jobId=${jobId ?? "(none)"} -> found=${outcome.found}` +
+          (outcome.itemKey ? ` itemKey=${outcome.itemKey}` : "") +
+          (outcome.reason ? ` (${outcome.reason})` : ""),
+      );
+      return [200, "application/json", JSON.stringify(outcome)];
+    } catch (error) {
+      log(`GET ${CONFIRM_PATH} handler threw: ${error}`);
+      return [
+        500,
+        "application/json",
+        JSON.stringify({ found: false, error: String(error) }),
       ];
     }
   },

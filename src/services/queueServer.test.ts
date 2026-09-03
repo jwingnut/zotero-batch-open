@@ -6,11 +6,15 @@ import {
   enqueueSelectedItems,
   clearConnectorQueue,
   extractMaxParam,
+  extractQueryParam,
+  checkConfirm,
   jobQueue,
   QueueEndpoint,
   ResultEndpoint,
   StatusEndpoint,
+  ConfirmEndpoint,
   type ApplyResultDeps,
+  type ConfirmDeps,
   type ZoteroItemLike,
   type EnqueueSelectableItem,
 } from "@/services/queueServer";
@@ -40,6 +44,7 @@ describe("registerEndpointsOnRegistry", () => {
     expect(registry["/batchopen/queue"]).toBe(QueueEndpoint);
     expect(registry["/batchopen/result"]).toBe(ResultEndpoint);
     expect(registry["/batchopen/status"]).toBe(StatusEndpoint);
+    expect(registry["/batchopen/confirm"]).toBe(ConfirmEndpoint);
   });
 
   it("reports failure when the registry is undefined", () => {
@@ -318,7 +323,11 @@ describe("reconcileInBackground", () => {
       },
     });
 
-    await reconcileInBackground({ jobId, ok: true, savedItemKeys: [] }, job, deps);
+    await reconcileInBackground(
+      { jobId, ok: true, savedItemKeys: [] },
+      job,
+      deps,
+    );
 
     expect(dupAttachment.parentID).toBe(100);
     expect(trashedIds).toEqual([300]);
@@ -404,7 +413,8 @@ describe("reconcileInBackground", () => {
       job,
       baseDeps({
         items: {
-          getByLibraryAndKey: (_lib, key) => (key === "ORIG1" ? original : false),
+          getByLibraryAndKey: (_lib, key) =>
+            key === "ORIG1" ? original : false,
         },
         trash: async () => {
           trashCalled = true;
@@ -505,7 +515,9 @@ describe("enqueueSelectedItems", () => {
     await enqueueSelectedItems([item], { get: () => null }, 3, resolver);
     const [job] = jobQueue.takeBatch(1);
     expect(job.url).toBe("https://publisher.example.com/article/1");
-    expect(jobQueue.get(job.jobId)?.originalUrl).toBe("https://doi.org/10.1000/xyz");
+    expect(jobQueue.get(job.jobId)?.originalUrl).toBe(
+      "https://doi.org/10.1000/xyz",
+    );
   });
 
   it("falls back to the unresolved URL when the redirector resolver fails to resolve", async () => {
@@ -724,6 +736,127 @@ describe("StatusEndpoint", () => {
     // Still there -- nothing was claimed by the status check itself.
     expect(jobQueue.pendingCount()).toBe(1);
     expect(jobQueue.inFlightCount()).toBe(1);
+  });
+});
+
+function baseConfirmDeps(overrides: Partial<ConfirmDeps> = {}): ConfirmDeps {
+  return {
+    items: { getByLibraryAndKey: () => false },
+    findDuplicate: () => null,
+    ...overrides,
+  };
+}
+
+describe("checkConfirm", () => {
+  beforeEach(() => {
+    jobQueue.clear();
+  });
+
+  it("reports not found (with a reason) for an unknown jobId", async () => {
+    const outcome = await checkConfirm("does-not-exist", baseConfirmDeps());
+    expect(outcome.found).toBe(false);
+    expect(outcome.reason).toMatch(/unknown jobId/);
+  });
+
+  it("reports not found (with a reason) when jobId is missing", async () => {
+    const outcome = await checkConfirm(undefined, baseConfirmDeps());
+    expect(outcome.found).toBe(false);
+    expect(outcome.reason).toMatch(/missing jobId/);
+  });
+
+  it("reports not found when the original item no longer exists", async () => {
+    const jobId = jobQueue.enqueue({
+      url: "https://x",
+      itemKey: "ORIG1",
+      libraryID: 1,
+    });
+    const outcome = await checkConfirm(jobId, baseConfirmDeps());
+    expect(outcome.found).toBe(false);
+    expect(outcome.reason).toMatch(/original item not found/);
+  });
+
+  it("reports found with the matched item's key when findDuplicate matches", async () => {
+    const jobId = jobQueue.enqueue({
+      url: "https://x",
+      itemKey: "ORIG1",
+      libraryID: 1,
+    });
+    const original = makeItem(1, "ORIG1", []);
+    const duplicate = makeItem(2, "SAVED1", []);
+    const outcome = await checkConfirm(
+      jobId,
+      baseConfirmDeps({
+        items: {
+          getByLibraryAndKey: (libraryID, key) =>
+            libraryID === 1 && key === "ORIG1" ? original : false,
+        },
+        findDuplicate: (passedOriginal, windowStartMs) => {
+          expect(passedOriginal).toBe(original);
+          expect(windowStartMs).toBe(jobQueue.get(jobId)?.enqueuedAtMs);
+          return { item: duplicate, rule: "doi" };
+        },
+      }),
+    );
+    expect(outcome.found).toBe(true);
+    expect(outcome.itemKey).toBe("SAVED1");
+  });
+
+  it("reports not found when no duplicate is matched", async () => {
+    const jobId = jobQueue.enqueue({
+      url: "https://x",
+      itemKey: "ORIG1",
+      libraryID: 1,
+    });
+    const original = makeItem(1, "ORIG1", []);
+    const outcome = await checkConfirm(
+      jobId,
+      baseConfirmDeps({
+        items: { getByLibraryAndKey: () => original },
+        findDuplicate: () => null,
+      }),
+    );
+    expect(outcome.found).toBe(false);
+    expect(outcome.itemKey).toBeUndefined();
+  });
+});
+
+describe("extractQueryParam", () => {
+  it("reads a value out of a plain object", () => {
+    expect(extractQueryParam({ jobId: "job_1" }, "jobId")).toBe("job_1");
+  });
+
+  it("reads a value out of a raw query string, with or without a leading '?'", () => {
+    expect(extractQueryParam("jobId=job_1", "jobId")).toBe("job_1");
+    expect(extractQueryParam("?jobId=job_1", "jobId")).toBe("job_1");
+  });
+
+  it("returns undefined when the key is absent", () => {
+    expect(extractQueryParam({}, "jobId")).toBeUndefined();
+    expect(extractQueryParam(undefined, "jobId")).toBeUndefined();
+  });
+});
+
+describe("ConfirmEndpoint", () => {
+  beforeEach(() => {
+    jobQueue.clear();
+  });
+
+  it("returns found:false for a missing jobId query param", async () => {
+    const endpoint = new ConfirmEndpoint();
+    const [status, , body] = await endpoint.init({ query: {} });
+    expect(status).toBe(200);
+    expect(JSON.parse(body)).toEqual({ found: false, reason: "missing jobId" });
+  });
+
+  it("returns found:false with a reason for an unknown jobId", async () => {
+    const endpoint = new ConfirmEndpoint();
+    const [status, , body] = await endpoint.init({
+      query: { jobId: "does-not-exist" },
+    });
+    expect(status).toBe(200);
+    const parsed = JSON.parse(body);
+    expect(parsed.found).toBe(false);
+    expect(parsed.reason).toMatch(/unknown jobId/);
   });
 });
 
