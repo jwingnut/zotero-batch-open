@@ -36,7 +36,18 @@ declare global {
 
     namespace Items {
       function get(id: number): Item | null;
-      function getAll(): Item[];
+      /**
+       * Returns all items in a given library. Async, and requires a
+       * libraryID -- see zotero-types'
+       * types/xpcom/data/items.d.ts. Calling this with no
+       * arguments returns a Promise, not an array.
+       */
+      function getAll(
+        libraryID: number,
+        onlyTopLevel?: boolean,
+        includeDeleted?: boolean,
+        asIDs?: boolean,
+      ): Promise<Item[]>;
       /** Move item(s) to trash (Zotero 7+); do not use setField('deleted', …). */
       function trash(ids: number | number[]): Promise<void>;
     }

@@ -35,6 +35,7 @@ import {
   selectCandidates,
   planReconciliation,
   parseZoteroDateAddedMs,
+  resolveAllItems,
 } from "@/core/reconcile";
 import { appendLogLine } from "@/utils/fileLog";
 
@@ -386,7 +387,7 @@ export interface ApplyResultDeps {
   findDuplicate(
     original: ZoteroItemLike,
     windowStartMs: number,
-  ): FoundDuplicate | null;
+  ): FoundDuplicate | null | Promise<FoundDuplicate | null>;
 }
 
 export interface ApplyResultOutcome {
@@ -412,7 +413,10 @@ function moveFileAttachments(
     let moved = 0;
     for (const attId of saved.getAttachments()) {
       const attachment = deps.getItem(attId);
-      if (!attachment || !isFileAttachment(attachment, deps.linkedUrlLinkMode)) {
+      if (
+        !attachment ||
+        !isFileAttachment(attachment, deps.linkedUrlLinkMode)
+      ) {
         continue;
       }
       attachment.parentID = original.id;
@@ -515,7 +519,9 @@ export async function reconcileInBackground(
 
   const original = deps.items.getByLibraryAndKey(job.libraryID, job.itemKey);
   if (!original) {
-    log(`${logPrefix} FAILED: original item not found for itemKey=${job.itemKey}`);
+    log(
+      `${logPrefix} FAILED: original item not found for itemKey=${job.itemKey}`,
+    );
     return;
   }
 
@@ -528,12 +534,10 @@ export async function reconcileInBackground(
       readyKeys = savedKeys.filter((key) => {
         const saved = deps.items.getByLibraryAndKey(job.libraryID, key);
         if (!saved) return false;
-        return saved
-          .getAttachments()
-          .some((id) => {
-            const att = deps.getItem(id);
-            return !!att && isFileAttachment(att, deps.linkedUrlLinkMode);
-          });
+        return saved.getAttachments().some((id) => {
+          const att = deps.getItem(id);
+          return !!att && isFileAttachment(att, deps.linkedUrlLinkMode);
+        });
       });
       if (readyKeys.length > 0 || deps.now() >= deadline) break;
       await deps.sleep(deps.pollIntervalMs);
@@ -563,9 +567,13 @@ export async function reconcileInBackground(
     // within budget -- fall back to duplicate matching (DOI, then
     // PMID/arXiv, then title+year), scoped to items added since this job
     // was handed out.
-    const found = deps.findDuplicate(original, job.enqueuedAtMs);
+    const found = await deps.findDuplicate(original, job.enqueuedAtMs);
     if (found) {
-      const movedForThis = await moveFileAttachments(found.item, original, deps);
+      const movedForThis = await moveFileAttachments(
+        found.item,
+        original,
+        deps,
+      );
       filesMoved += movedForThis;
       if (movedForThis > 0) {
         await deps.trash(found.item.id);
@@ -613,15 +621,22 @@ function readAttachmentWaitMsPref(): number {
   }
 }
 
-function liveFindDuplicate(
+async function liveFindDuplicate(
   original: ZoteroItemLike,
   windowStartMs: number,
-): FoundDuplicate | null {
+): Promise<FoundDuplicate | null> {
   try {
+    // Real Zotero.Items.getAll(libraryID, onlyTopLevel?, includeDeleted?,
+    // asIDs?) is async and requires a libraryID -- see
+    // node_modules/zotero-types/types/xpcom/data/items.d.ts. Calling it with
+    // no args (as this used to) returns a Promise, not an array, which made
+    // the .filter() below throw "allItems.filter is not a function".
     const ZoteroItems = Zotero.Items as unknown as {
-      getAll(): ZoteroItemLike[];
+      getAll(libraryID: number): ZoteroItemLike[] | Promise<ZoteroItemLike[]>;
     };
-    const allItems = ZoteroItems.getAll();
+    const allItems = await resolveAllItems(() =>
+      ZoteroItems.getAll(original.libraryID),
+    );
     const candidates = selectCandidates(allItems, {
       excludeIds: new Set([original.id]),
       libraryIDs: new Set([original.libraryID]),

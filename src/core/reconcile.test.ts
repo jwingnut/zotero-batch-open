@@ -3,6 +3,7 @@ import {
   parseZoteroDateAddedMs,
   planReconciliation,
   reconcileConfirmMessage,
+  resolveAllItems,
   selectCandidates,
   type ReconcileItem,
 } from "./reconcile";
@@ -34,6 +35,56 @@ describe("parseZoteroDateAddedMs", () => {
 
   it("returns null for unparseable input", () => {
     expect(parseZoteroDateAddedMs("not a date")).toBeNull();
+  });
+});
+
+describe("resolveAllItems", () => {
+  it("awaits a promise-returning fetch and returns the resolved array", async () => {
+    const items = [item(1, 1, {})];
+    const result = await resolveAllItems(() => Promise.resolve(items));
+    expect(result).toBe(items);
+  });
+
+  it("returns a synchronously-returned array as-is", async () => {
+    const items = [item(1, 1, {})];
+    const result = await resolveAllItems(() => items);
+    expect(result).toBe(items);
+  });
+
+  it("throws a descriptive Error (not a bare TypeError) for a non-array result", async () => {
+    // e.g. what Zotero.Items.getAll() returns when called with no
+    // libraryID -- a Promise that resolves to something unexpected, or
+    // (mocked here) a plain object instead of an array.
+    await expect(
+      resolveAllItems(
+        () => ({ not: "an array" }) as unknown as ReconcileItem[],
+      ),
+    ).rejects.toThrow(/did not return an array \(got object\)/);
+  });
+
+  it("throws a descriptive Error for a null result", async () => {
+    await expect(
+      resolveAllItems(() => null as unknown as ReconcileItem[]),
+    ).rejects.toThrow(/did not return an array \(got null\)/);
+  });
+
+  it("throws a descriptive Error when the resolved promise is not an array", async () => {
+    await expect(
+      resolveAllItems(() =>
+        Promise.resolve(undefined as unknown as ReconcileItem[]),
+      ),
+    ).rejects.toThrow(/did not return an array \(got undefined\)/);
+  });
+
+  it("never throws a bare TypeError like 'x.filter is not a function'", async () => {
+    let caught: unknown;
+    try {
+      await resolveAllItems(() => 42 as unknown as ReconcileItem[]);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(TypeError);
   });
 });
 

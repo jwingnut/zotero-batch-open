@@ -28,6 +28,7 @@ import {
   planReconciliation,
   parseZoteroDateAddedMs,
   reconcileConfirmMessage,
+  resolveAllItems,
   selectCandidates,
   type MatchResult,
 } from "@/core/reconcile";
@@ -755,9 +756,18 @@ export class BatchOpenPlugin {
     const excludeIds = new Set(originals.map((item) => item.id));
     const libraryIDs = new Set(originals.map((item) => item.libraryID));
 
+    // Zotero.Items.getAll(libraryID, ...) is async and per-library (see
+    // typings/zotero.d.ts) -- fetch each library the selection spans and
+    // await/validate each result via resolveAllItems() so a promise or a
+    // non-array response can't throw a bare TypeError out of .filter().
     let allItems: Zotero.Item[];
     try {
-      allItems = Zotero.Items.getAll();
+      const perLibrary = await Promise.all(
+        Array.from(libraryIDs).map((libraryID) =>
+          resolveAllItems<Zotero.Item>(() => Zotero.Items.getAll(libraryID)),
+        ),
+      );
+      allItems = perLibrary.flat();
     } catch (error) {
       this.reportError(`${label}: Items.getAll`, error);
       return;

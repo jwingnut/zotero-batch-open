@@ -17,6 +17,24 @@ export interface ReconcileItem {
   getField(field: string): string;
 }
 
+/**
+ * Resolve Zotero.Items.getAll() (or any similarly-shaped item fetch) into a
+ * plain array, defensively: awaits it if it returns a promise (the real
+ * Zotero.Items.getAll(libraryID, ...) is async), and if the resolved value
+ * still isn't an array, throws a descriptive Error naming the actual type
+ * instead of letting `.filter` blow up with a bare TypeError downstream.
+ */
+export async function resolveAllItems<T>(
+  fetchAllItems: () => T[] | Promise<T[]>,
+): Promise<T[]> {
+  const result = await fetchAllItems();
+  if (!Array.isArray(result)) {
+    const actualType = result === null ? "null" : typeof result;
+    throw new Error(`Items lookup did not return an array (got ${actualType})`);
+  }
+  return result;
+}
+
 export interface CandidateFilterOptions<T> {
   /** Items to exclude outright (the original selection itself). */
   excludeIds: Set<number>;
