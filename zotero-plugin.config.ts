@@ -7,6 +7,12 @@ export default defineConfig({
   name: pkg.config.addonName,
   id: pkg.config.addonID,
   namespace: pkg.config.addonRef,
+  // Auto-update: Zotero polls updateURL and installs the xpi it names. Both point at
+  // the "latest" release, so publishing a release is the whole release process.
+  updateURL:
+    "https://github.com/jwingnut/zotero-batch-open/releases/latest/download/update.json",
+  xpiDownloadLink:
+    "https://github.com/jwingnut/zotero-batch-open/releases/latest/download/batch-open.xpi",
   version: {
     min: "8.0",
     max: "10.*",

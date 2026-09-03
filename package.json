@@ -1,7 +1,7 @@
 {
   "name": "zotero-batch-open",
   "type": "module",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Open or search the selected items in your browser, in bulk.",
   "config": {
     "addonName": "Batch Open",
