@@ -14,3 +14,5 @@ batchopen-menu-open-browser-missing-pdf =
     .label = Open all in browser (only those missing a PDF)
 batchopen-menu-reconcile-attachments =
     .label = Attach newly saved files to the selected items
+batchopen-menu-save-via-connector =
+    .label = Save selected via connector

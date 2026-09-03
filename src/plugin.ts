@@ -34,9 +34,15 @@ import {
 import type { AddonData } from "@/shared/types";
 import { appendLogLine } from "@/utils/fileLog";
 import { getPreferredLocale } from "@/utils/locale";
+import { registerQueueServer, enqueueSelectedItems } from "@/services/queueServer";
 
 type CommandKind =
-  "open" | "scholar" | "web" | "open-missing-pdf" | "reconcile";
+  | "open"
+  | "scholar"
+  | "web"
+  | "open-missing-pdf"
+  | "reconcile"
+  | "save-connector";
 
 const COMMAND_LABELS: Record<CommandKind, string> = {
   open: LIBRARY_ITEM_MENU_LABELS[0],
@@ -44,6 +50,7 @@ const COMMAND_LABELS: Record<CommandKind, string> = {
   web: LIBRARY_ITEM_MENU_LABELS[2],
   "open-missing-pdf": LIBRARY_ITEM_MENU_LABELS[3],
   reconcile: LIBRARY_ITEM_MENU_LABELS[4],
+  "save-connector": LIBRARY_ITEM_MENU_LABELS[5],
 };
 
 const PREF = {
@@ -87,6 +94,7 @@ export class BatchOpenPlugin {
     this.addonData = data;
     this.log(`${this.version()} starting; locale=${getPreferredLocale()}`);
     await this.registerMenus();
+    registerQueueServer();
   }
 
   /** The running plugin version, for logging and on-screen display. */
@@ -219,6 +227,7 @@ export class BatchOpenPlugin {
       "web",
       "open-missing-pdf",
       "reconcile",
+      "save-connector",
     ];
 
     const contextShowing = (
@@ -374,6 +383,7 @@ export class BatchOpenPlugin {
         "web",
         "open-missing-pdf",
         "reconcile",
+        "save-connector",
       ];
       const menuItemDefs = [
         {
@@ -395,6 +405,10 @@ export class BatchOpenPlugin {
         {
           id: "zotero-itemmenu-batch-open-reconcile",
           label: LIBRARY_ITEM_MENU_LABELS[4],
+        },
+        {
+          id: "zotero-itemmenu-batch-open-save-connector",
+          label: LIBRARY_ITEM_MENU_LABELS[5],
         },
       ];
 
@@ -460,6 +474,8 @@ export class BatchOpenPlugin {
 
       if (kind === "reconcile") {
         await this.runReconcileBody(selected);
+      } else if (kind === "save-connector") {
+        await this.runSaveViaConnectorBody(selected);
       } else {
         await this.runCommandBody(kind, selected);
       }
@@ -927,6 +943,50 @@ export class BatchOpenPlugin {
       `reconcile match original=${this.itemKey(original)} duplicate=${this.itemKey(duplicate)} ` +
         `rule=${match.rule}${similarity} ${outcome}`,
     );
+  }
+
+  // ---------------------------------------------------------------------
+  // "Save selected via connector" (remote-trigger queue — see REMOTE_TRIGGER.md)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Enqueues the selected items (missing a stored PDF) onto the local
+   * queue served at /batchopen/queue for the zotero-connectors fork's
+   * poller to pick up and save. Does not itself open anything — this only
+   * publishes work; nothing happens until the fork's poller is on and
+   * fetches it. See src/services/queueServer.ts.
+   */
+  private async runSaveViaConnectorBody(selected: Zotero.Item[]): Promise<void> {
+    const label = COMMAND_LABELS["save-connector"];
+
+    if (selected.length === 0) {
+      this.toast(label, "No items selected.", { short: true });
+      return;
+    }
+
+    const linkedUrlMode = this.linkedUrlLinkMode();
+    const result = enqueueSelectedItems(selected, Zotero.Items, linkedUrlMode);
+
+    this.log(
+      `save-connector: enqueued=${result.enqueued} skippedHasPdf=${result.skippedHasPdf} ` +
+        `skippedNoUrl=${result.skippedNoUrl} skippedNotRegular=${result.skippedNotRegular}`,
+    );
+
+    const lines = [
+      `Enqueued ${result.enqueued} item(s) for the connector to save.`,
+      `• Already had a stored PDF: ${result.skippedHasPdf}`,
+      `• No URL, DOI, or attachment URL to save from: ${result.skippedNoUrl}`,
+    ];
+    if (result.skippedNotRegular > 0) {
+      lines.push(
+        `• Skipped from selection (notes, attachments, or annotations): ${result.skippedNotRegular}`,
+      );
+    }
+    lines.push(
+      "Nothing happens until the zotero-connectors remote-trigger poller is turned on in the browser.",
+    );
+
+    this.toast(label, lines.join("\n"));
   }
 
   // ---------------------------------------------------------------------
