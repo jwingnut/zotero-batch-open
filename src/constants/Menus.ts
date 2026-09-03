@@ -30,6 +30,8 @@ export const LIBRARY_ITEM_MENU_L10N_IDS = [
   "batchopen-menu-open-browser",
   "batchopen-menu-search-scholar",
   "batchopen-menu-search-web",
+  "batchopen-menu-open-browser-missing-pdf",
+  "batchopen-menu-reconcile-attachments",
 ] as const;
 
 /** Fallback labels if Fluent is not bound (legacy / tests). */
@@ -37,6 +39,8 @@ export const LIBRARY_ITEM_MENU_LABELS = [
   "Open all in browser",
   "Search all in Google Scholar",
   "Search all in web search",
+  "Open all in browser (only those missing a PDF)",
+  "Attach newly saved files to the selected items",
 ] as const;
 
 /** Submenu fallback label. */

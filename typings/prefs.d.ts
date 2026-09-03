@@ -11,6 +11,7 @@ declare namespace _ZoteroTypes {
       "searchTemplate": string;
       "confirmAbove": number;
       "delayMs": number;
+      "reconcileWindowMinutes": number;
     };
   }
 }

@@ -65,5 +65,24 @@
       Staggers opening so a large batch does not arrive all at once (and so
       Google Scholar does not serve a CAPTCHA).
     </description>
+
+    <hbox align="center">
+      <label
+        value="Reconcile window (minutes):"
+        control="batchopen-pref-reconcile-window"
+      />
+      <html:input
+        id="batchopen-pref-reconcile-window"
+        type="number"
+        min="1"
+        max="10080"
+        preference="extensions.zotero.batchopen.reconcileWindowMinutes"
+      />
+    </hbox>
+    <description class="tip">
+      "Attach newly saved files to the selected items" only looks at items added
+      to your library within this many minutes ago when searching for a
+      connector-created duplicate to merge.
+    </description>
   </groupbox>
 </vbox>

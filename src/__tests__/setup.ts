@@ -63,6 +63,11 @@ testGlobal.Zotero = {
   Items: {
     get: () => null,
     getAll: () => [],
+    trash: async () => {},
+  },
+  Attachments: {
+    // Standard Zotero link-mode value for "linked URL" (not a stored file).
+    LINK_MODE_LINKED_URL: 3,
   },
   ItemTypes: {
     getName: () => "journalArticle",

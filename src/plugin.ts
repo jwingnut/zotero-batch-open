@@ -18,16 +18,32 @@ import {
   type ResolvedUrl,
 } from "@/core/urlResolution";
 import { shouldConfirm, confirmPromptMessage } from "@/core/confirm";
+import {
+  hasStoredPdf,
+  isFileAttachment,
+  splitByMissingPdf,
+  type AttachmentRef,
+} from "@/core/attachments";
+import {
+  planReconciliation,
+  parseZoteroDateAddedMs,
+  reconcileConfirmMessage,
+  selectCandidates,
+  type MatchResult,
+} from "@/core/reconcile";
 import type { AddonData } from "@/shared/types";
 import { appendLogLine } from "@/utils/fileLog";
 import { getPreferredLocale } from "@/utils/locale";
 
-type CommandKind = "open" | "scholar" | "web";
+type CommandKind =
+  "open" | "scholar" | "web" | "open-missing-pdf" | "reconcile";
 
 const COMMAND_LABELS: Record<CommandKind, string> = {
   open: LIBRARY_ITEM_MENU_LABELS[0],
   scholar: LIBRARY_ITEM_MENU_LABELS[1],
   web: LIBRARY_ITEM_MENU_LABELS[2],
+  "open-missing-pdf": LIBRARY_ITEM_MENU_LABELS[3],
+  reconcile: LIBRARY_ITEM_MENU_LABELS[4],
 };
 
 const PREF = {
@@ -35,6 +51,7 @@ const PREF = {
   searchTemplate: "extensions.zotero.batchopen.searchTemplate",
   confirmAbove: "extensions.zotero.batchopen.confirmAbove",
   delayMs: "extensions.zotero.batchopen.delayMs",
+  reconcileWindowMinutes: "extensions.zotero.batchopen.reconcileWindowMinutes",
 } as const;
 
 interface SourceCounts {
@@ -196,7 +213,13 @@ export class BatchOpenPlugin {
 
     const pluginID = this.addonData?.id || "batch-open@jwhitney";
     const menuID = "batch-open-main-library-item-actions";
-    const commands: CommandKind[] = ["open", "scholar", "web"];
+    const commands: CommandKind[] = [
+      "open",
+      "scholar",
+      "web",
+      "open-missing-pdf",
+      "reconcile",
+    ];
 
     const contextShowing = (
       ctx: {
@@ -345,7 +368,13 @@ export class BatchOpenPlugin {
         id: "zotero-itemmenu-batch-open-menupopup",
       });
 
-      const commandForIndex: CommandKind[] = ["open", "scholar", "web"];
+      const commandForIndex: CommandKind[] = [
+        "open",
+        "scholar",
+        "web",
+        "open-missing-pdf",
+        "reconcile",
+      ];
       const menuItemDefs = [
         {
           id: "zotero-itemmenu-batch-open-open-browser",
@@ -358,6 +387,14 @@ export class BatchOpenPlugin {
         {
           id: "zotero-itemmenu-batch-open-search-web",
           label: LIBRARY_ITEM_MENU_LABELS[2],
+        },
+        {
+          id: "zotero-itemmenu-batch-open-open-browser-missing-pdf",
+          label: LIBRARY_ITEM_MENU_LABELS[3],
+        },
+        {
+          id: "zotero-itemmenu-batch-open-reconcile",
+          label: LIBRARY_ITEM_MENU_LABELS[4],
         },
       ];
 
@@ -421,7 +458,11 @@ export class BatchOpenPlugin {
       selectedCount = selected.length;
       this.log(`command=${kind} selected=${selectedCount}`);
 
-      await this.runCommandBody(kind, selected);
+      if (kind === "reconcile") {
+        await this.runReconcileBody(selected);
+      } else {
+        await this.runCommandBody(kind, selected);
+      }
 
       this.log(`command=${kind} completed`);
     } catch (error) {
@@ -452,9 +493,31 @@ export class BatchOpenPlugin {
       return;
     }
 
+    let items = regularItems;
+    let alreadyHadPdf = 0;
+    if (kind === "open-missing-pdf") {
+      const linkedUrlMode = this.linkedUrlLinkMode();
+      const split = splitByMissingPdf(
+        items,
+        (item) => this.getAttachmentRefs(item),
+        linkedUrlMode,
+      );
+      items = split.needsPdf;
+      alreadyHadPdf = split.alreadyHasPdf;
+
+      if (items.length === 0) {
+        this.toast(
+          COMMAND_LABELS[kind],
+          `All ${regularItems.length} selected item(s) already have a stored PDF. Nothing to open.`,
+          { short: true },
+        );
+        return;
+      }
+    }
+
     const confirmAbove = this.getPref(PREF.confirmAbove, 25);
-    if (shouldConfirm(regularItems.length, confirmAbove)) {
-      const proceed = this.confirm(confirmPromptMessage(regularItems.length));
+    if (shouldConfirm(items.length, confirmAbove)) {
+      const proceed = this.confirm(confirmPromptMessage(items.length));
       if (!proceed) {
         this.toast(COMMAND_LABELS[kind], "Cancelled. 0 items opened.", {
           short: true,
@@ -483,10 +546,10 @@ export class BatchOpenPlugin {
       w.changeHeadline(`Batch Open · ${COMMAND_LABELS[kind]}`),
     );
 
-    for (let i = 0; i < regularItems.length; i++) {
-      const item = regularItems[i];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
       this.safeProgress(progress, (w) =>
-        w.changeHeadline(`Opening ${i + 1} of ${regularItems.length}…`),
+        w.changeHeadline(`Opening ${i + 1} of ${items.length}…`),
       );
 
       try {
@@ -503,21 +566,22 @@ export class BatchOpenPlugin {
         this.log(`Failed to open item: ${error}`);
       }
 
-      if (delayMs > 0 && i < regularItems.length - 1) {
+      if (delayMs > 0 && i < items.length - 1) {
         await this.sleep(delayMs);
       }
     }
 
     const summary = this.formatSummary(
       kind,
-      regularItems.length,
+      items.length,
       opened,
       counts,
       skippedCount,
       errorLabels,
+      alreadyHadPdf,
     );
 
-    const headline = `Batch Open ${this.version()} · opened ${opened} of ${regularItems.length}`;
+    const headline = `Batch Open ${this.version()} · opened ${opened} of ${items.length}`;
     const shownDescriptionLines = summary.slice(1); // "Opened N of M" is now in the headline.
 
     const progressUsable = this.safeProgress(
@@ -568,10 +632,11 @@ export class BatchOpenPlugin {
     counts: SourceCounts,
     skippedCount: number,
     errorLabels: string[],
+    alreadyHadPdf = 0,
   ): string[] {
     const lines: string[] = [`Opened ${opened} of ${totalRegular} item(s).`];
 
-    if (kind === "open") {
+    if (kind === "open" || kind === "open-missing-pdf") {
       lines.push(`• From a stored URL: ${counts.stored}`);
       lines.push(`• From a DOI: ${counts.doi}`);
       lines.push(`• From an attachment URL: ${counts.attachment}`);
@@ -582,6 +647,10 @@ export class BatchOpenPlugin {
           `• Skipped (no URL, DOI, or attachment; fallback set to skip): ${counts.skipped}`,
         );
       }
+    }
+
+    if (kind === "open-missing-pdf" && alreadyHadPdf > 0) {
+      lines.push(`• Skipped (already had a stored PDF): ${alreadyHadPdf}`);
     }
 
     if (skippedCount > 0) {
@@ -611,8 +680,293 @@ export class BatchOpenPlugin {
   }
 
   // ---------------------------------------------------------------------
+  // "Attach newly saved files to the selected items" (reconcile)
+  // ---------------------------------------------------------------------
+
+  /**
+   * For each selected item (the originals), find a connector-created
+   * duplicate added within the reconcile window, move its stored/imported
+   * file attachments onto the original, and trash the emptied duplicate.
+   * Never touches an original's existing attachments.
+   */
+  private async runReconcileBody(selected: Zotero.Item[]): Promise<void> {
+    const label = COMMAND_LABELS.reconcile;
+
+    if (selected.length === 0) {
+      this.toast(label, "No items selected.", { short: true });
+      return;
+    }
+
+    const { regularItems: originals, skippedCount } = splitSelection(selected);
+    if (originals.length === 0) {
+      this.toast(
+        label,
+        "No regular items in the selection (notes, attachments, and annotations are skipped).",
+        { short: true },
+      );
+      return;
+    }
+
+    const windowMinutes = this.getPref(PREF.reconcileWindowMinutes, 120);
+    const windowStartMs = Date.now() - Math.max(0, windowMinutes) * 60 * 1000;
+
+    const excludeIds = new Set(originals.map((item) => item.id));
+    const libraryIDs = new Set(originals.map((item) => item.libraryID));
+
+    let allItems: Zotero.Item[];
+    try {
+      allItems = Zotero.Items.getAll();
+    } catch (error) {
+      this.reportError(`${label}: Items.getAll`, error);
+      return;
+    }
+
+    const candidates = selectCandidates(allItems, {
+      excludeIds,
+      libraryIDs,
+      isTopLevelRegular: (item) => {
+        try {
+          return item.isRegularItem() && item.isTopLevelItem();
+        } catch {
+          return false;
+        }
+      },
+      dateAddedMs: (item) => {
+        try {
+          return parseZoteroDateAddedMs(item.getField("dateAdded"));
+        } catch {
+          return null;
+        }
+      },
+      windowStartMs,
+    });
+
+    const plan = planReconciliation(originals, candidates);
+
+    if (plan.length === 0) {
+      this.toast(
+        label,
+        `No likely duplicates found among items added in the last ${windowMinutes} minute(s).`,
+        { short: true },
+      );
+      return;
+    }
+
+    const linkedUrlMode = this.linkedUrlLinkMode();
+
+    interface PreparedMatch {
+      original: Zotero.Item;
+      duplicate: Zotero.Item;
+      match: MatchResult;
+      fileAttachments: Zotero.Item[];
+      bothHadPdf: boolean;
+    }
+
+    const prepared: PreparedMatch[] = plan.map(
+      ({ original, duplicate, match }) => {
+        const duplicateAttachments = this.getAttachmentRefs(duplicate);
+        const fileAttachments = duplicateAttachments.filter((a) =>
+          isFileAttachment(a, linkedUrlMode),
+        );
+        const originalHadPdf = hasStoredPdf(
+          this.getAttachmentRefs(original),
+          linkedUrlMode,
+        );
+        const duplicateHasPdf = hasStoredPdf(
+          duplicateAttachments,
+          linkedUrlMode,
+        );
+        return {
+          original,
+          duplicate,
+          match,
+          fileAttachments,
+          bothHadPdf: originalHadPdf && duplicateHasPdf,
+        };
+      },
+    );
+
+    const filesMovedCount = prepared.reduce(
+      (sum, p) => sum + p.fileAttachments.length,
+      0,
+    );
+    const itemsReceivingCount = prepared.filter(
+      (p) => p.fileAttachments.length > 0,
+    ).length;
+    const duplicatesToTrashCount = prepared.length;
+
+    const message = reconcileConfirmMessage(
+      filesMovedCount,
+      itemsReceivingCount,
+      duplicatesToTrashCount,
+    );
+    const proceed = this.confirm(message);
+    if (!proceed) {
+      this.toast(label, "Cancelled. Nothing changed.", { short: true });
+      return;
+    }
+
+    const progress = this.createProgressWindow();
+    this.safeProgress(progress, (w) =>
+      w.changeHeadline(`Batch Open · ${label}`),
+    );
+
+    let filesMoved = 0;
+    let itemsReceived = 0;
+    let duplicatesTrashed = 0;
+    let bothHadPdfCount = 0;
+    const errorLabels: string[] = [];
+
+    for (let i = 0; i < prepared.length; i++) {
+      const p = prepared[i];
+      this.safeProgress(progress, (w) =>
+        w.changeHeadline(`Reconciling ${i + 1} of ${prepared.length}…`),
+      );
+
+      try {
+        let movedForThis = 0;
+        for (const attachment of p.fileAttachments) {
+          attachment.parentID = p.original.id;
+          await attachment.saveTx();
+
+          const verified = Zotero.Items.get(attachment.id);
+          if (!verified || verified.parentID !== p.original.id) {
+            throw new Error(
+              `Attachment ${attachment.id} did not reassign to item ${p.original.id}`,
+            );
+          }
+          movedForThis += 1;
+        }
+
+        await Zotero.Items.trash(p.duplicate.id);
+
+        filesMoved += movedForThis;
+        if (movedForThis > 0) itemsReceived += 1;
+        duplicatesTrashed += 1;
+        if (p.bothHadPdf) bothHadPdfCount += 1;
+
+        this.logReconcileMatch(
+          p.original,
+          p.duplicate,
+          p.match,
+          movedForThis,
+          true,
+        );
+      } catch (error) {
+        errorLabels.push(this.itemLabel(p.original));
+        this.logReconcileMatch(
+          p.original,
+          p.duplicate,
+          p.match,
+          0,
+          false,
+          error,
+        );
+      }
+    }
+
+    const lines: string[] = [
+      `Attached files to ${itemsReceived} of ${itemsReceivingCount} item(s); moved ${filesMoved} file(s).`,
+      `Moved ${duplicatesTrashed} of ${duplicatesToTrashCount} duplicate item(s) to the trash (reversible — see the Zotero trash).`,
+    ];
+    if (bothHadPdfCount > 0) {
+      lines.push(
+        `• ${bothHadPdfCount} item(s) already had a stored PDF and now keep both after the merge.`,
+      );
+    }
+    if (skippedCount > 0) {
+      lines.push(
+        `• Skipped from selection (notes, attachments, or annotations): ${skippedCount}`,
+      );
+    }
+    if (errorLabels.length > 0) {
+      lines.push(`• Errors: ${errorLabels.length}`);
+      const detail = errorLabels.slice(0, 5).map((l) => `  – ${l}`);
+      lines.push(...detail);
+      if (errorLabels.length > 5) {
+        lines.push(`  … and ${errorLabels.length - 5} more not listed`);
+      }
+    }
+
+    const headline = `Batch Open ${this.version()} · ${label}`;
+    const progressUsable = this.safeProgress(
+      progress,
+      (w) => {
+        w.changeHeadline(headline);
+        for (const line of lines) {
+          w.addDescription(line);
+        }
+        w.startCloseTimer(Math.min(14500, 4300 + lines.length * 520));
+        return true;
+      },
+      false,
+    );
+
+    if (!progressUsable) {
+      this.toast(label, lines.join("\n"));
+    }
+  }
+
+  /** One line to batch-open.log per match decision, so a wrong merge is reconstructable. */
+  private logReconcileMatch(
+    original: Zotero.Item,
+    duplicate: Zotero.Item,
+    match: MatchResult,
+    filesMoved: number,
+    trashed: boolean,
+    error?: unknown,
+  ): void {
+    const similarity =
+      match.similarity !== undefined
+        ? ` similarity=${match.similarity.toFixed(3)}`
+        : "";
+    const outcome = error
+      ? `failed=${error instanceof Error ? error.message : String(error)}`
+      : `filesMoved=${filesMoved} trashed=${trashed}`;
+    this.log(
+      `reconcile match original=${this.itemKey(original)} duplicate=${this.itemKey(duplicate)} ` +
+        `rule=${match.rule}${similarity} ${outcome}`,
+    );
+  }
+
+  // ---------------------------------------------------------------------
   // Small platform helpers (thin enough to not need dedicated unit tests)
   // ---------------------------------------------------------------------
+
+  /** Resolved attachment child items (not just ids) for one item. */
+  private getAttachmentRefs(
+    item: Zotero.Item,
+  ): (Zotero.Item & AttachmentRef)[] {
+    try {
+      return item
+        .getAttachments()
+        .map((id) => Zotero.Items.get(id))
+        .filter((a): a is Zotero.Item => !!a);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The live value of Zotero.Attachments.LINK_MODE_LINKED_URL, falling back
+   * to the documented Zotero constant (3) if the namespace is unavailable.
+   */
+  private linkedUrlLinkMode(): number {
+    try {
+      const value = Zotero.Attachments?.LINK_MODE_LINKED_URL;
+      return typeof value === "number" ? value : 3;
+    } catch {
+      return 3;
+    }
+  }
+
+  private itemKey(item: Zotero.Item): string {
+    try {
+      return item.key || `id:${item.id}`;
+    } catch {
+      return `id:${item.id}`;
+    }
+  }
 
   private getPref<T>(key: string, defaultValue: T): T {
     try {

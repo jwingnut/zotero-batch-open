@@ -5,6 +5,8 @@ declare global {
   namespace Zotero {
     interface Item {
       id: number;
+      /** Stable library-unique identifier (e.g. "ABCD1234"), used for log lines. */
+      key?: string;
       libraryID: number;
       itemTypeID: number;
       getField(field: string): string;
@@ -22,11 +24,26 @@ declare global {
         fieldMode?: number;
       }>;
       getAttachments(): number[];
+      /** The id of the parent item; 0/falsy for a top-level item. Settable to reparent. */
+      parentID?: number;
+      /** MIME type, e.g. "application/pdf"; only meaningful on attachment items. */
+      attachmentContentType?: string;
+      /** One of Zotero.Attachments.LINK_MODE_*; only meaningful on attachment items. */
+      attachmentLinkMode?: number;
+      save(): Promise<void>;
+      saveTx(): Promise<void>;
     }
 
     namespace Items {
       function get(id: number): Item | null;
       function getAll(): Item[];
+      /** Move item(s) to trash (Zotero 7+); do not use setField('deleted', …). */
+      function trash(ids: number | number[]): Promise<void>;
+    }
+
+    namespace Attachments {
+      /** The one link mode that means "a link to a URL, not a stored/imported file". */
+      const LINK_MODE_LINKED_URL: number;
     }
 
     namespace ItemTypes {

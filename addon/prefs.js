@@ -14,3 +14,7 @@ pref("extensions.zotero.batchopen.confirmAbove", 25);
 
 // Delay in milliseconds between opening each tab.
 pref("extensions.zotero.batchopen.delayMs", 300);
+
+// How many minutes back to look for connector-created duplicates when
+// reconciling ("Attach newly saved files to the selected items").
+pref("extensions.zotero.batchopen.reconcileWindowMinutes", 120);

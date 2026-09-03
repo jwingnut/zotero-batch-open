@@ -4,6 +4,8 @@
 // @ts-nocheck
 export type FluentMessageId =
   | 'batchopen-menu-open-browser'
+  | 'batchopen-menu-open-browser-missing-pdf'
+  | 'batchopen-menu-reconcile-attachments'
   | 'batchopen-menu-search-scholar'
   | 'batchopen-menu-search-web'
   | 'batchopen-submenu';

@@ -24,6 +24,38 @@ under the **Batch Open** submenu):
    URL.
 3. **Search all in web search** — same, using your configured web search
    engine template.
+4. **Open all in browser (only those missing a PDF)** — same as command 1,
+   but first drops any selected item that already has a stored/imported PDF
+   attachment (a linked-URL attachment doesn't count as "having" the PDF).
+   The summary reports how many were skipped for already having one.
+5. **Attach newly saved files to the selected items** — reconciles items the
+   Zotero Connector just saved as new top-level duplicates (see "How the
+   workflow fits together" below). For each selected item (the originals),
+   it looks for a duplicate top-level item added to the same library within
+   the last N minutes (configurable) and matches it by, in order: normalized
+   DOI; PMID/arXiv id (from the Extra field); or a close title match plus the
+   same year. On a match, every stored/imported file attachment (PDFs and
+   snapshots — not linked-URL attachments) is moved from the duplicate onto
+   the original, and the now-empty duplicate is moved to the **trash**
+   (never permanently deleted — this is reversible from Zotero's trash). An
+   original's existing attachments are never touched; if both the original
+   and the duplicate already had a stored PDF, both are kept and the summary
+   says so. This command always asks for confirmation first, naming exactly
+   how many files will be attached and how many duplicates will be trashed.
+
+## How the workflow fits together
+
+UC Davis library access is only available through a browser session on the
+VPN, so this plugin never downloads anything itself. The intended loop is:
+
+1. Select items missing a PDF and run **Open all in browser (only those
+   missing a PDF)** to open just the tabs that need saving.
+2. Press the Zotero Connector's save button on each tab. The connector saves
+   each page as a new top-level item with the PDF attached, rather than
+   attaching it to the item you already had.
+3. Re-select the original items and run **Attach newly saved files to the
+   selected items** to move each connector-created PDF onto the original and
+   send the now-empty duplicate to the trash.
 
 Only regular items are acted on; notes, attachments, and annotations in the
 selection are skipped and counted in the summary. Opening more than the
@@ -35,15 +67,22 @@ Google Scholar doesn't serve a CAPTCHA).
 
 Zotero → Settings → Batch Open:
 
-| Setting                                  | Preference key                               | Default                                   |
-| ---------------------------------------- | -------------------------------------------- | ----------------------------------------- |
-| Fallback when an item has no usable URL  | `extensions.zotero.batchopen.fallback`       | `scholar` (`scholar` / `web` / `none`)    |
-| Web search template                      | `extensions.zotero.batchopen.searchTemplate` | `https://www.google.com/search?q={query}` |
-| Confirm before opening more than N items | `extensions.zotero.batchopen.confirmAbove`   | `25`                                      |
-| Delay between tabs (ms)                  | `extensions.zotero.batchopen.delayMs`        | `300`                                     |
+| Setting                                  | Preference key                                       | Default                                   |
+| ---------------------------------------- | ---------------------------------------------------- | ----------------------------------------- |
+| Fallback when an item has no usable URL  | `extensions.zotero.batchopen.fallback`               | `scholar` (`scholar` / `web` / `none`)    |
+| Web search template                      | `extensions.zotero.batchopen.searchTemplate`         | `https://www.google.com/search?q={query}` |
+| Confirm before opening more than N items | `extensions.zotero.batchopen.confirmAbove`           | `25`                                      |
+| Delay between tabs (ms)                  | `extensions.zotero.batchopen.delayMs`                | `300`                                     |
+| Reconcile window (minutes)               | `extensions.zotero.batchopen.reconcileWindowMinutes` | `120`                                     |
 
 The web search template must be an `http(s)` URL containing the literal text
-`{query}`; an invalid template falls back to the default with a warning.
+`{query}`; an invalid template falls back to the default with a warning. The
+reconcile window controls how far back "Attach newly saved files to the
+selected items" looks for a connector-created duplicate to merge.
+
+Every reconcile match decision (which items, which rule matched, similarity
+where relevant, and what moved) is logged to `batch-open.log` in the Zotero
+data directory, so a merge can be reconstructed after the fact.
 
 ## Installing the xpi
 
