@@ -4,6 +4,7 @@ import {
   applyResult,
   enqueueSelectedItems,
   clearConnectorQueue,
+  extractMaxParam,
   jobQueue,
   QueueEndpoint,
   ResultEndpoint,
@@ -323,6 +324,66 @@ describe("enqueueSelectedItems", () => {
   });
 });
 
+describe("extractMaxParam", () => {
+  it("returns undefined when options.query is absent", () => {
+    expect(extractMaxParam({})).toBeUndefined();
+  });
+
+  it("returns undefined when options.query is null", () => {
+    expect(
+      extractMaxParam({ query: null as unknown as undefined }),
+    ).toBeUndefined();
+  });
+
+  it("reads max from the documented/actual Record<string,string> shape", () => {
+    expect(extractMaxParam({ query: { max: "1" } })).toBe("1");
+  });
+
+  it("returns undefined from a Record shape with no max key", () => {
+    expect(extractMaxParam({ query: { other: "1" } })).toBeUndefined();
+  });
+
+  it("reads max from a raw query string", () => {
+    expect(extractMaxParam({ query: "max=5" })).toBe("5");
+  });
+
+  it("reads max from a raw query string with a leading '?'", () => {
+    expect(extractMaxParam({ query: "?max=5" })).toBe("5");
+  });
+
+  it("reads max from a raw query string with other params present", () => {
+    expect(extractMaxParam({ query: "foo=bar&max=3&baz=1" })).toBe("3");
+  });
+
+  it("returns undefined from a raw query string with no max param", () => {
+    expect(extractMaxParam({ query: "foo=bar" })).toBeUndefined();
+  });
+
+  it("reads max from a URLSearchParams-like object", () => {
+    expect(extractMaxParam({ query: new URLSearchParams("max=7") })).toBe("7");
+  });
+
+  it("returns undefined from a URLSearchParams-like object with no max param", () => {
+    expect(
+      extractMaxParam({ query: new URLSearchParams("foo=bar") }),
+    ).toBeUndefined();
+  });
+
+  it("reads max from a Record keyed with a leading '?max'", () => {
+    expect(extractMaxParam({ query: { "?max": "2" } })).toBe("2");
+  });
+
+  it("prefers an unprefixed 'max' key over '?max' when both are present", () => {
+    expect(extractMaxParam({ query: { max: "1", "?max": "2" } })).toBe("1");
+  });
+
+  it("takes the first value when max arrived as an array (repeated query param)", () => {
+    expect(
+      extractMaxParam({ query: { max: ["4", "9"] as unknown as string } }),
+    ).toBe("4");
+  });
+});
+
 describe("QueueEndpoint", () => {
   beforeEach(() => {
     jobQueue.clear();
@@ -365,6 +426,32 @@ describe("QueueEndpoint", () => {
     });
     expect(status).toBe(200);
     expect(JSON.parse(body).jobs).toHaveLength(1);
+  });
+
+  it("caps the batch at ?max= given as a raw query string instead of a Record", async () => {
+    jobQueue.enqueue({ url: "https://x/0", itemKey: "K0", libraryID: 1 });
+    jobQueue.enqueue({ url: "https://x/1", itemKey: "K1", libraryID: 1 });
+    const endpoint = new QueueEndpoint();
+    const [status, , body] = await endpoint.init({
+      query: "max=1" as unknown as Record<string, string>,
+    });
+    expect(status).toBe(200);
+    expect(JSON.parse(body).jobs).toHaveLength(1);
+    expect(jobQueue.pendingCount()).toBe(1);
+  });
+
+  it("does not hand out a job that is already in-flight (claimed by an earlier poll)", async () => {
+    jobQueue.enqueue({ url: "https://x", itemKey: "K", libraryID: 1 });
+    // Simulate an earlier, unlimited poll having already claimed the only
+    // job -- this is the scenario the live-Zotero diagnostic actually hit:
+    // a bare GET /batchopen/queue claimed the one queued job before a
+    // follow-up GET /batchopen/queue?max=1 was made, so the second request
+    // correctly sees nothing pending. That is not a parsing bug.
+    jobQueue.takeBatch(10);
+    const endpoint = new QueueEndpoint();
+    const [status, , body] = await endpoint.init({ query: { max: "1" } });
+    expect(status).toBe(200);
+    expect(JSON.parse(body).jobs).toHaveLength(0);
   });
 });
 

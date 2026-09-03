@@ -165,7 +165,7 @@ export function registerQueueServer(): void {
 // ---------------------------------------------------------------------
 
 export interface QueueEndpointOptions {
-  query?: Record<string, string>;
+  query?: unknown;
 }
 
 export const QueueEndpoint = function (this: unknown) {} as unknown as {
@@ -173,6 +173,65 @@ export const QueueEndpoint = function (this: unknown) {} as unknown as {
     init: (options: QueueEndpointOptions) => Promise<[number, string, string]>;
   };
 };
+
+/**
+ * Extracts the raw `max` value out of whatever shape Zotero.Server actually
+ * hands the endpoint as `options.query`.
+ *
+ * The documented/actual shape (zotero-types' server.d.ts, matching Zotero's
+ * own dispatch in Zotero.Server.DataListener.prototype._processEndpoint --
+ * `query: this.query ? Zotero.Server.decodeQueryString(this.query.substr(1))
+ * : {}`, see zotero-connectors' vendored src/zotero/chrome/content/zotero/
+ * xpcom/server.js) is a plain `Record<string, string>` with an unprefixed
+ * key ("max", not "?max"). This is deliberately tolerant of other shapes
+ * anyway -- a raw query string, a URLSearchParams-like object, a repeated
+ * parameter arriving as an array, or a key that still carries its leading
+ * "?" -- so that a shape this endpoint doesn't anticipate is treated the
+ * same as "no ?max given" (batchSize falls back to the default, i.e. no
+ * limit) rather than ever being misread as "?max=0" and silently returning
+ * no jobs.
+ */
+export function extractMaxParam(
+  options: QueueEndpointOptions,
+): string | undefined {
+  const query = options?.query;
+  if (query === undefined || query === null) {
+    return undefined;
+  }
+
+  // A raw query string, e.g. "max=1" or "?max=1".
+  if (typeof query === "string") {
+    const stripped = query.startsWith("?") ? query.slice(1) : query;
+    const value = new URLSearchParams(stripped).get("max");
+    return value === null ? undefined : value;
+  }
+
+  // A URLSearchParams (or URLSearchParams-like) object.
+  if (
+    typeof query === "object" &&
+    typeof (query as { get?: unknown }).get === "function"
+  ) {
+    const value = (query as URLSearchParams).get("max");
+    return value === null || value === undefined ? undefined : String(value);
+  }
+
+  // A plain object -- the documented/actual shape -- tolerant of a key that
+  // still carries a leading "?" and of a value that arrived as an array
+  // (e.g. from a repeated query parameter; the first value wins).
+  if (typeof query === "object") {
+    const record = query as Record<string, unknown>;
+    let value: unknown = record.max;
+    if (value === undefined) {
+      value = record["?max"];
+    }
+    if (Array.isArray(value)) {
+      value = value[0];
+    }
+    return value === undefined || value === null ? undefined : String(value);
+  }
+
+  return undefined;
+}
 
 QueueEndpoint.prototype = {
   supportedMethods: ["GET"],
@@ -187,15 +246,27 @@ QueueEndpoint.prototype = {
   ): Promise<[number, string, string]> {
     try {
       let batchSize = DEFAULT_BATCH_SIZE;
-      const rawMax = options?.query?.max;
+      const rawMax = extractMaxParam(options);
       if (rawMax !== undefined) {
         const parsed = Number.parseInt(rawMax, 10);
         if (Number.isFinite(parsed) && parsed > 0) {
           batchSize = Math.min(parsed, DEFAULT_BATCH_SIZE);
         }
+        // else: rawMax was present but unparseable (NaN, "0", negative,
+        // non-numeric) -- fall through with the default batch size (i.e.
+        // "no limit") rather than ever treating a parse failure as "hand out
+        // zero jobs".
       }
       const jobs: QueuedJob[] = jobQueue.takeBatch(batchSize);
-      log(`GET ${QUEUE_PATH} -> ${jobs.length} job(s) handed out`);
+      // Log every poll, including one that yields nothing, so a request
+      // that arrived but had no jobs to hand out (queue empty, or every
+      // pending job already claimed/in-flight) is distinguishable in
+      // batch-open.log from no request having arrived at all.
+      log(
+        `GET ${QUEUE_PATH} -> ${jobs.length} job(s) handed out ` +
+          `(max=${rawMax ?? "(none)"}, batchSize=${batchSize}, ` +
+          `pending=${jobQueue.pendingCount()}, inFlight=${jobQueue.inFlightCount()})`,
+      );
       return [200, "application/json", JSON.stringify({ jobs })];
     } catch (error) {
       log(`GET ${QUEUE_PATH} handler threw: ${error}`);
