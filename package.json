@@ -14,7 +14,7 @@
   "license": "AGPL-3.0-or-later",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jwhitney/zotero-batch-open.git"
+    "url": "git+https://github.com/jwingnut/zotero-batch-open.git"
   },
   "scripts": {
     "start": "zotero-plugin serve",
@@ -56,5 +56,9 @@
         }
       }
     ]
+  },
+  "homepage": "https://github.com/jwingnut/zotero-batch-open#readme",
+  "bugs": {
+    "url": "https://github.com/jwingnut/zotero-batch-open/issues"
   }
 }

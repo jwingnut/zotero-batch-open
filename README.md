@@ -1,7 +1,12 @@
+<img src="addon/icons/batch-open-128.png" alt="" width="96" align="right">
+
 # Batch Open
 
 A Zotero 10 plugin for opening or searching a batch of selected items in your
 browser. Select 10 or 100 items, right-click, and open them all at once.
+
+**[Download the latest .xpi](https://github.com/jwingnut/zotero-batch-open/releases/latest)** —
+then in Zotero: Tools → Add-ons → gear → Install Add-on From File.
 
 ## Commands
 

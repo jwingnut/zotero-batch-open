@@ -4,6 +4,14 @@
   "version": "0.1.1",
   "description": "Open or search the selected items in your browser, in bulk.",
   "author": "Jason Whitney",
+  "homepage_url": "https://github.com/jwingnut/zotero-batch-open",
+  "icons": {
+    "32": "icons/batch-open-32.png",
+    "48": "icons/batch-open-48.png",
+    "64": "icons/batch-open-64.png",
+    "96": "icons/batch-open-96.png",
+    "128": "icons/batch-open-128.png"
+  },
   "applications": {
     "zotero": {
       "id": "batch-open@jwhitney",
