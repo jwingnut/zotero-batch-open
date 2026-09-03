@@ -35,12 +35,12 @@ Google Scholar doesn't serve a CAPTCHA).
 
 Zotero → Settings → Batch Open:
 
-| Setting | Preference key | Default |
-|---|---|---|
-| Fallback when an item has no usable URL | `extensions.zotero.batchopen.fallback` | `scholar` (`scholar` / `web` / `none`) |
-| Web search template | `extensions.zotero.batchopen.searchTemplate` | `https://www.google.com/search?q={query}` |
-| Confirm before opening more than N items | `extensions.zotero.batchopen.confirmAbove` | `25` |
-| Delay between tabs (ms) | `extensions.zotero.batchopen.delayMs` | `300` |
+| Setting                                  | Preference key                               | Default                                   |
+| ---------------------------------------- | -------------------------------------------- | ----------------------------------------- |
+| Fallback when an item has no usable URL  | `extensions.zotero.batchopen.fallback`       | `scholar` (`scholar` / `web` / `none`)    |
+| Web search template                      | `extensions.zotero.batchopen.searchTemplate` | `https://www.google.com/search?q={query}` |
+| Confirm before opening more than N items | `extensions.zotero.batchopen.confirmAbove`   | `25`                                      |
+| Delay between tabs (ms)                  | `extensions.zotero.batchopen.delayMs`        | `300`                                     |
 
 The web search template must be an `http(s)` URL containing the literal text
 `{query}`; an invalid template falls back to the default with a warning.

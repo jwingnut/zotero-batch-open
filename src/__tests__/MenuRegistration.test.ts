@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { BatchOpenPlugin } from "@/plugin";
 import { LIBRARY_ITEM_MENU_LABELS } from "@/constants/Menus";
 
@@ -171,6 +171,37 @@ describe("MenuRegistration (Zotero 8+ MenuManager)", () => {
     const action = (calls[0].menus[0].menus ?? [])[0];
 
     expect(() => action.onCommand?.({}, {})).not.toThrow();
+  });
+
+  it("onCommand swallows and logs a callback that rejects with undefined", async () => {
+    const plugin = new BatchOpenPlugin() as unknown as {
+      runCommand: (kind: string) => Promise<void>;
+    };
+    // Simulate the reported crash: a callback whose promise rejects with no
+    // value at all (e.g. a bare `Promise.reject()` or `throw undefined`).
+    plugin.runCommand = () => Promise.reject();
+
+    const logSpy = vi.spyOn(Zotero, "log");
+
+    await (plugin as unknown as BatchOpenPlugin).init({
+      id: "batch-open@jwhitney",
+      version: "0.1.3",
+      rootURI: "",
+    });
+    logSpy.mockClear();
+
+    const calls = getMenuRegisterCalls();
+    const action = (calls[0].menus[0].menus ?? [])[0];
+
+    expect(() => action.onCommand?.({}, {})).not.toThrow();
+    // Let the rejected promise's .catch handler run.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const logged = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(logged).toContain("Batch Open");
+    expect(logged).toContain("type=undefined");
+
+    logSpy.mockRestore();
   });
 
   it("does not double-register when both the MenuManager and legacy paths are attempted", async () => {

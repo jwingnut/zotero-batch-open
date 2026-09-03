@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { BatchOpenPlugin } from "@/plugin";
 
 interface TestItem {
@@ -119,6 +119,118 @@ describe("BatchOpenPlugin — search commands", () => {
     };
     await plugin.runCommand("web");
     expect(launchCalls()).toEqual(["https://duckduckgo.com/?q=Term"]);
+  });
+});
+
+describe("BatchOpenPlugin — dead progress window", () => {
+  let originalProgressWindow: typeof Zotero.ProgressWindow;
+
+  beforeEach(() => {
+    originalProgressWindow = Zotero.ProgressWindow;
+  });
+
+  afterEach(() => {
+    Zotero.ProgressWindow = originalProgressWindow;
+  });
+
+  it("falls back to a toast summary when the progress window is already closed", async () => {
+    // Simulates closeOnClick / an already-fired close timer: any call after
+    // construction throws, as it would against a dead window.
+    class DeadProgressWindow {
+      show() {}
+      changeHeadline(): void {
+        throw new Error("window is closed");
+      }
+      addDescription(): void {
+        throw new Error("window is closed");
+      }
+      startCloseTimer(): void {
+        throw new Error("window is closed");
+      }
+    }
+    (Zotero as unknown as { ProgressWindow: unknown }).ProgressWindow =
+      DeadProgressWindow;
+
+    setPane([regularItem({ url: "https://example.com/a" })]);
+    const plugin = new BatchOpenPlugin() as unknown as {
+      runCommand(kind: "open" | "scholar" | "web"): Promise<void>;
+    };
+
+    await expect(plugin.runCommand("open")).resolves.toBeUndefined();
+    // The item still opens even though every progress-window call failed.
+    expect(launchCalls()).toEqual(["https://example.com/a"]);
+  });
+
+  it("does not throw when the progress window dies mid-run (closeOnClick)", async () => {
+    class DiesAfterFirstCall {
+      private calls = 0;
+      show() {}
+      changeHeadline(): void {
+        this.calls += 1;
+        if (this.calls > 1) {
+          throw new Error("window is closed");
+        }
+      }
+      addDescription(): void {
+        throw new Error("window is closed");
+      }
+      startCloseTimer(): void {
+        throw new Error("window is closed");
+      }
+    }
+    (Zotero as unknown as { ProgressWindow: unknown }).ProgressWindow =
+      DiesAfterFirstCall;
+
+    setPane([
+      regularItem({ url: "https://example.com/1" }),
+      regularItem({ url: "https://example.com/2" }),
+    ]);
+    const plugin = new BatchOpenPlugin() as unknown as {
+      runCommand(kind: "open" | "scholar" | "web"): Promise<void>;
+    };
+
+    await expect(plugin.runCommand("open")).resolves.toBeUndefined();
+    expect(launchCalls()).toEqual([
+      "https://example.com/1",
+      "https://example.com/2",
+    ]);
+  });
+});
+
+describe("BatchOpenPlugin — repeated runs", () => {
+  it("a second consecutive runCommand works after the first completed", async () => {
+    setPane([regularItem({ url: "https://example.com/first" })]);
+    const plugin = new BatchOpenPlugin() as unknown as {
+      runCommand(kind: "open" | "scholar" | "web"): Promise<void>;
+    };
+    await plugin.runCommand("open");
+    expect(launchCalls()).toEqual(["https://example.com/first"]);
+
+    setPane([regularItem({ url: "https://example.com/second" })]);
+    await plugin.runCommand("open");
+    expect(launchCalls()).toEqual([
+      "https://example.com/first",
+      "https://example.com/second",
+    ]);
+  });
+
+  it("a second consecutive runCommand works after the first failed", async () => {
+    // First run: selection lookup itself throws (e.g. a stale pane).
+    (
+      Zotero as unknown as { getActiveZoteroPane: () => unknown }
+    ).getActiveZoteroPane = () => {
+      throw new Error("pane unavailable");
+    };
+    const plugin = new BatchOpenPlugin() as unknown as {
+      runCommand(kind: "open" | "scholar" | "web"): Promise<void>;
+    };
+    await expect(plugin.runCommand("open")).resolves.toBeUndefined();
+    expect(launchCalls()).toEqual([]);
+
+    // Second run: pane is back, and the run succeeds normally.
+    setPane([regularItem({ url: "https://example.com/after-failure" })]);
+    await plugin.runCommand("open");
+    expect(launchCalls()).toEqual(["https://example.com/after-failure"]);
   });
 });
 

@@ -66,7 +66,83 @@ export class BatchOpenPlugin {
 
   async init(data: AddonData): Promise<void> {
     this.addonData = data;
+    this.log(`${this.version()} starting`);
     await this.registerMenus();
+  }
+
+  /** The running plugin version, for logging and on-screen display. */
+  private version(): string {
+    return this.addonData?.version || "?";
+  }
+
+  /**
+   * Last-resort guard for a menu callback / command entry point.
+   *
+   * `fn` may throw synchronously or return a rejecting promise (including
+   * one that rejects with `undefined`, e.g. `Promise.reject()`). Either way
+   * this method guarantees the failure is logged with its type and stack
+   * (when available) and surfaced to the user — it never lets a bare
+   * rejection escape, and the reporting itself cannot throw.
+   */
+  private guard(context: string, fn: () => void | Promise<void>): void {
+    try {
+      const result = fn();
+      if (result && typeof (result as Promise<void>).then === "function") {
+        (result as Promise<void>).catch((error: unknown) => {
+          this.reportError(context, error);
+        });
+      }
+    } catch (error) {
+      this.reportError(context, error);
+    }
+  }
+
+  /**
+   * Log and surface an error from a guarded entry point. Defensive by
+   * design: every step is wrapped so this method itself cannot throw or
+   * produce a new unhandled rejection, even if `error` is `undefined` or
+   * something unusual.
+   */
+  private reportError(context: string, error: unknown): void {
+    let type = "unknown";
+    let detail = "(no message)";
+    let stack: string | undefined;
+
+    try {
+      type =
+        error === undefined
+          ? "undefined"
+          : error === null
+            ? "null"
+            : (error as { constructor?: { name?: string } })?.constructor
+                ?.name || typeof error;
+      detail = error instanceof Error ? error.message : String(error);
+      stack = error instanceof Error ? error.stack : undefined;
+    } catch {
+      // Even inspecting the error threw; fall back to the defaults above.
+    }
+
+    try {
+      this.log(
+        `${context} failed: type=${type} message=${detail}${
+          stack ? `\n${stack}` : ""
+        }`,
+      );
+    } catch {
+      // Nothing more we can do about logging failing.
+    }
+
+    try {
+      this.toast(
+        SUBMENU_LABEL,
+        `Something went wrong (${context}). See Help → Debug Output ` +
+          `Logging → View Output and search "Batch Open" for details.`,
+        { short: true },
+      );
+    } catch {
+      // toast() already has its own internal fallback and catch; this is
+      // only a final backstop in case something unexpected still throws.
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -175,18 +251,9 @@ export class BatchOpenPlugin {
         l10nID,
         onShowing: safeOnShowing(LIBRARY_ITEM_MENU_LABELS[i]),
         onCommand: () => {
-          try {
-            void this.runCommand(commands[i]).catch((err: unknown) => {
-              this.log(
-                `Menu command failed: ${err instanceof Error ? err.message : String(err)}`,
-              );
-            });
-          } catch (error) {
-            // runCommand is an async function and cannot throw
-            // synchronously, but this guards against any future refactor
-            // that breaks that guarantee.
-            this.log(`onCommand handler failed synchronously: ${error}`);
-          }
+          this.guard(`onCommand(${commands[i]})`, () =>
+            this.runCommand(commands[i]),
+          );
         },
       }));
 
@@ -228,6 +295,13 @@ export class BatchOpenPlugin {
     try {
       const doc = window.document;
 
+      if (doc.getElementById("zotero-itemmenu-batch-open-menu")) {
+        // Already added to this window (e.g. onMainWindowReady fired more
+        // than once for it); avoid appending a second, duplicate-ID menu.
+        this.log("Menu already present in window; skipping duplicate add");
+        return;
+      }
+
       const menu = ZoteroUtils.createXULElement(doc, "menu", {
         id: "zotero-itemmenu-batch-open-menu",
         class: "menu-iconic",
@@ -260,11 +334,9 @@ export class BatchOpenPlugin {
           label: def.label,
         });
         menuItem.addEventListener("command", () => {
-          void this.runCommand(commandForIndex[i]).catch((err: unknown) => {
-            this.log(
-              `Menu command failed: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
+          this.guard(`legacyCommand(${commandForIndex[i]})`, () =>
+            this.runCommand(commandForIndex[i]),
+          );
         });
         menuPopup.appendChild(menuItem);
         this.addedElementIDs.push(def.id);
@@ -309,9 +381,28 @@ export class BatchOpenPlugin {
   // ---------------------------------------------------------------------
 
   private async runCommand(kind: CommandKind): Promise<void> {
-    const pane = Zotero.getActiveZoteroPane();
-    const selected = pane ? pane.getSelectedItems() : [];
+    let selectedCount = 0;
+    try {
+      const pane = Zotero.getActiveZoteroPane();
+      const selected = pane ? pane.getSelectedItems() : [];
+      selectedCount = selected.length;
+      this.log(`command=${kind} selected=${selectedCount}`);
 
+      await this.runCommandBody(kind, selected);
+
+      this.log(`command=${kind} completed`);
+    } catch (error) {
+      // runCommandBody should not throw (its own steps are guarded below),
+      // but this is the final backstop for this entry point: nothing from
+      // here escapes as a bare rejection.
+      this.reportError(`runCommand(${kind})`, error);
+    }
+  }
+
+  private async runCommandBody(
+    kind: CommandKind,
+    selected: Zotero.Item[],
+  ): Promise<void> {
     if (selected.length === 0) {
       this.toast(COMMAND_LABELS[kind], "No items selected.", { short: true });
       return;
@@ -355,11 +446,15 @@ export class BatchOpenPlugin {
     let opened = 0;
 
     const progress = this.createProgressWindow();
-    progress?.changeHeadline(`Batch Open · ${COMMAND_LABELS[kind]}`);
+    this.safeProgress(progress, (w) =>
+      w.changeHeadline(`Batch Open · ${COMMAND_LABELS[kind]}`),
+    );
 
     for (let i = 0; i < regularItems.length; i++) {
       const item = regularItems[i];
-      progress?.changeHeadline(`Opening ${i + 1} of ${regularItems.length}…`);
+      this.safeProgress(progress, (w) =>
+        w.changeHeadline(`Opening ${i + 1} of ${regularItems.length}…`),
+      );
 
       try {
         const resolved = this.resolveForCommand(kind, item, fallback, template);
@@ -389,13 +484,23 @@ export class BatchOpenPlugin {
       errorLabels,
     );
 
-    if (progress) {
-      progress.changeHeadline(`Batch Open · ${COMMAND_LABELS[kind]}`);
-      for (const line of summary) {
-        progress.addDescription(line);
-      }
-      progress.startCloseTimer(Math.min(14500, 4300 + summary.length * 520));
-    } else {
+    const headline = `Batch Open ${this.version()} · opened ${opened} of ${regularItems.length}`;
+    const shownDescriptionLines = summary.slice(1); // "Opened N of M" is now in the headline.
+
+    const progressUsable = this.safeProgress(
+      progress,
+      (w) => {
+        w.changeHeadline(headline);
+        for (const line of shownDescriptionLines) {
+          w.addDescription(line);
+        }
+        w.startCloseTimer(Math.min(14500, 4300 + summary.length * 520));
+        return true;
+      },
+      false,
+    );
+
+    if (!progressUsable) {
       this.toast(COMMAND_LABELS[kind], summary.join("\n"));
     }
   }
@@ -521,6 +626,30 @@ export class BatchOpenPlugin {
     } catch (error) {
       this.log(`ProgressWindow unavailable: ${error}`);
       return null;
+    }
+  }
+
+  /**
+   * Call into a possibly-dead `ProgressWindow` (it may have been closed by
+   * `closeOnClick`, a prior close timer, or a race with the user) without
+   * letting that throw escape. On failure this degrades to a log line and
+   * returns `fallback` instead of raising.
+   */
+  private safeProgress<T>(
+    win: Zotero.ProgressWindow | null,
+    fn: (w: Zotero.ProgressWindow) => T,
+    fallback?: T,
+  ): T | undefined {
+    if (!win) {
+      return fallback;
+    }
+    try {
+      return fn(win);
+    } catch (error) {
+      this.log(
+        `ProgressWindow interaction failed (window likely closed): ${error}`,
+      );
+      return fallback;
     }
   }
 
