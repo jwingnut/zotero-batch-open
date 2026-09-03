@@ -34,7 +34,11 @@ import {
 import type { AddonData } from "@/shared/types";
 import { appendLogLine } from "@/utils/fileLog";
 import { getPreferredLocale } from "@/utils/locale";
-import { registerQueueServer, enqueueSelectedItems } from "@/services/queueServer";
+import {
+  registerQueueServer,
+  enqueueSelectedItems,
+  clearConnectorQueue,
+} from "@/services/queueServer";
 
 type CommandKind =
   | "open"
@@ -42,7 +46,8 @@ type CommandKind =
   | "web"
   | "open-missing-pdf"
   | "reconcile"
-  | "save-connector";
+  | "save-connector"
+  | "clear-connector-queue";
 
 const COMMAND_LABELS: Record<CommandKind, string> = {
   open: LIBRARY_ITEM_MENU_LABELS[0],
@@ -51,6 +56,7 @@ const COMMAND_LABELS: Record<CommandKind, string> = {
   "open-missing-pdf": LIBRARY_ITEM_MENU_LABELS[3],
   reconcile: LIBRARY_ITEM_MENU_LABELS[4],
   "save-connector": LIBRARY_ITEM_MENU_LABELS[5],
+  "clear-connector-queue": LIBRARY_ITEM_MENU_LABELS[6],
 };
 
 const PREF = {
@@ -228,6 +234,7 @@ export class BatchOpenPlugin {
       "open-missing-pdf",
       "reconcile",
       "save-connector",
+      "clear-connector-queue",
     ];
 
     const contextShowing = (
@@ -237,6 +244,7 @@ export class BatchOpenPlugin {
         items?: Zotero.Item[];
       },
       label: string,
+      requiresSelection: boolean,
     ): void => {
       // ctx is supplied by Zotero and its shape varies across Zotero 8-10;
       // every member is treated as possibly absent and this must never throw
@@ -248,11 +256,13 @@ export class BatchOpenPlugin {
       }
 
       try {
-        const items = ctx?.items;
         let enabled = true;
-        if (Array.isArray(items)) {
-          enabled =
-            items.length > 0 && items.some((item) => item?.isRegularItem?.());
+        if (requiresSelection) {
+          const items = ctx?.items;
+          if (Array.isArray(items)) {
+            enabled =
+              items.length > 0 && items.some((item) => item?.isRegularItem?.());
+          }
         }
         ctx?.setEnabled?.(enabled);
       } catch (error) {
@@ -262,6 +272,7 @@ export class BatchOpenPlugin {
 
     const safeOnShowing = (
       label: string,
+      requiresSelection: boolean,
     ): Zotero.MenuManager.MenuData["onShowing"] => {
       return (_event, ctx) => {
         try {
@@ -272,6 +283,7 @@ export class BatchOpenPlugin {
               items?: Zotero.Item[];
             },
             label,
+            requiresSelection,
           );
         } catch (error) {
           this.log(`onShowing handler failed: ${error}`);
@@ -290,7 +302,12 @@ export class BatchOpenPlugin {
         LIBRARY_ITEM_MENU_LABELS.map((label, i) => ({
           menuType: "menuitem" as const,
           ...(withL10nID ? { l10nID: LIBRARY_ITEM_MENU_L10N_IDS[i] } : {}),
-          onShowing: safeOnShowing(label),
+          // "Clear the connector queue" acts on the plugin-wide queue, not
+          // on the selection, so it stays enabled with nothing selected.
+          onShowing: safeOnShowing(
+            label,
+            commands[i] !== "clear-connector-queue",
+          ),
           onCommand: () => {
             this.guard(`onCommand(${commands[i]})`, () =>
               this.runCommand(commands[i]),
@@ -302,7 +319,7 @@ export class BatchOpenPlugin {
         {
           menuType: "submenu",
           ...(withL10nID ? { l10nID: LIBRARY_ITEM_SUBMENU_L10N_ID } : {}),
-          onShowing: safeOnShowing(SUBMENU_LABEL),
+          onShowing: safeOnShowing(SUBMENU_LABEL, false),
           menus: actionMenus,
         },
       ];
@@ -384,6 +401,7 @@ export class BatchOpenPlugin {
         "open-missing-pdf",
         "reconcile",
         "save-connector",
+        "clear-connector-queue",
       ];
       const menuItemDefs = [
         {
@@ -409,6 +427,10 @@ export class BatchOpenPlugin {
         {
           id: "zotero-itemmenu-batch-open-save-connector",
           label: LIBRARY_ITEM_MENU_LABELS[5],
+        },
+        {
+          id: "zotero-itemmenu-batch-open-clear-connector-queue",
+          label: LIBRARY_ITEM_MENU_LABELS[6],
         },
       ];
 
@@ -476,6 +498,8 @@ export class BatchOpenPlugin {
         await this.runReconcileBody(selected);
       } else if (kind === "save-connector") {
         await this.runSaveViaConnectorBody(selected);
+      } else if (kind === "clear-connector-queue") {
+        await this.runClearConnectorQueueBody();
       } else {
         await this.runCommandBody(kind, selected);
       }
@@ -956,7 +980,9 @@ export class BatchOpenPlugin {
    * publishes work; nothing happens until the fork's poller is on and
    * fetches it. See src/services/queueServer.ts.
    */
-  private async runSaveViaConnectorBody(selected: Zotero.Item[]): Promise<void> {
+  private async runSaveViaConnectorBody(
+    selected: Zotero.Item[],
+  ): Promise<void> {
     const label = COMMAND_LABELS["save-connector"];
 
     if (selected.length === 0) {
@@ -977,6 +1003,11 @@ export class BatchOpenPlugin {
       `• Already had a stored PDF: ${result.skippedHasPdf}`,
       `• No URL, DOI, or attachment URL to save from: ${result.skippedNoUrl}`,
     ];
+    if (result.skippedAlreadyQueued > 0) {
+      lines.push(
+        `• Already queued (a pending or in-flight job already exists): ${result.skippedAlreadyQueued}`,
+      );
+    }
     if (result.skippedNotRegular > 0) {
       lines.push(
         `• Skipped from selection (notes, attachments, or annotations): ${result.skippedNotRegular}`,
@@ -987,6 +1018,35 @@ export class BatchOpenPlugin {
     );
 
     this.toast(label, lines.join("\n"));
+  }
+
+  /**
+   * Empties pending and in-flight connector-queue jobs. Recovery path for a
+   * stuck queue (e.g. duplicate jobs from running "Save selected via
+   * connector" more than once before the poller started) that does not
+   * require restarting Zotero.
+   */
+  private async runClearConnectorQueueBody(): Promise<void> {
+    const label = COMMAND_LABELS["clear-connector-queue"];
+    const result = clearConnectorQueue();
+
+    this.log(
+      `clear-connector-queue: pendingCleared=${result.pendingCleared} ` +
+        `inFlightCleared=${result.inFlightCleared} totalCleared=${result.totalCleared}`,
+    );
+
+    if (result.totalCleared === 0) {
+      this.toast(label, "Queue was already empty. Nothing to clear.", {
+        short: true,
+      });
+      return;
+    }
+
+    this.toast(
+      label,
+      `Removed ${result.totalCleared} job(s) from the connector queue ` +
+        `(${result.pendingCleared} pending, ${result.inFlightCleared} in-flight).`,
+    );
   }
 
   // ---------------------------------------------------------------------

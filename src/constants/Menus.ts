@@ -33,6 +33,7 @@ export const LIBRARY_ITEM_MENU_L10N_IDS = [
   "batchopen-menu-open-browser-missing-pdf",
   "batchopen-menu-reconcile-attachments",
   "batchopen-menu-save-via-connector",
+  "batchopen-menu-clear-connector-queue",
 ] as const;
 
 /** Fallback labels if Fluent is not bound (legacy / tests). */
@@ -43,6 +44,7 @@ export const LIBRARY_ITEM_MENU_LABELS = [
   "Open all in browser (only those missing a PDF)",
   "Attach newly saved files to the selected items",
   "Save selected via connector",
+  "Clear the connector queue",
 ] as const;
 
 /** Submenu fallback label. */

@@ -11,12 +11,19 @@
 // without a running Zotero is whether *this* registration call executes at
 // the right point in plugin startup and survives Zotero's own connector
 // server reinitializing. registerQueueServer() is therefore defensive: it
-// verifies the assignment took (reads the property back) and then runs an
-// actual loopback HTTP self-test, logging a loud, unambiguous PASS/FAIL
-// line either way.
+// verifies the assignment took (reads the property back) and logs the
+// outcome loudly either way. It does NOT run its own loopback fetch() as a
+// self-test — Zotero blocks that kind of internal-to-itself request, so an
+// earlier version of this file logged a false "UNAVAILABLE" verdict even
+// while the real client (the browser connector) was fetching the endpoint
+// successfully. See registerQueueServer() below.
 
 import { splitSelection } from "@/core/selection";
-import { hasStoredPdf, isFileAttachment, type AttachmentRef } from "@/core/attachments";
+import {
+  hasStoredPdf,
+  isFileAttachment,
+  type AttachmentRef,
+} from "@/core/attachments";
 import { resolveOpenUrl } from "@/core/urlResolution";
 import { JobQueue, type QueuedJob } from "@/core/queue";
 import { appendLogLine } from "@/utils/fileLog";
@@ -26,7 +33,6 @@ export const DEFAULT_BATCH_SIZE = 25;
 
 const QUEUE_PATH = "/batchopen/queue";
 const RESULT_PATH = "/batchopen/result";
-const CONNECTOR_PORT = 23119;
 
 export interface ResultPayload {
   jobId: string;
@@ -73,8 +79,9 @@ export interface RegisterResult {
 /**
  * Registers the two endpoints. Returns whether the registry accepted both
  * assignments (verified by reading them back) — it does NOT by itself prove
- * the HTTP server will route to them; call `selfTestQueueEndpoint()`
- * afterward for that.
+ * the HTTP server will route to them, and there is no reliable in-process
+ * self-test for that (see the note at the top of this file); the browser
+ * connector's first successful poll is the real confirmation.
  */
 export function registerEndpointsOnRegistry(
   registry: EndpointRegistry | undefined | null,
@@ -82,7 +89,8 @@ export function registerEndpointsOnRegistry(
   if (!registry || typeof registry !== "object") {
     return {
       registered: false,
-      reason: "Zotero.Server.Endpoints is not available (undefined or not an object)",
+      reason:
+        "Zotero.Server.Endpoints is not available (undefined or not an object)",
     };
   }
 
@@ -110,15 +118,17 @@ export function registerEndpointsOnRegistry(
 
 /**
  * Registers the endpoints against the live `Zotero.Server.Endpoints`
- * object, logs the outcome loudly either way, and — on success — schedules
- * a real loopback HTTP self-test so a routing failure (as opposed to a mere
- * registration failure) is also caught and logged.
+ * object and logs the outcome loudly either way. On success this logs a
+ * plain factual line rather than a self-test verdict (see file header) —
+ * the browser connector's first `GET /batchopen/queue` is what actually
+ * proves the route is reachable.
  */
 export function registerQueueServer(): void {
   let registry: EndpointRegistry | undefined;
   try {
-    registry = (Zotero as unknown as { Server?: { Endpoints?: EndpointRegistry } })
-      .Server?.Endpoints;
+    registry = (
+      Zotero as unknown as { Server?: { Endpoints?: EndpointRegistry } }
+    ).Server?.Endpoints;
   } catch (error) {
     log(
       `ENDPOINT REGISTRATION FAILED: reading Zotero.Server.Endpoints threw: ${error}. ` +
@@ -137,71 +147,63 @@ export function registerQueueServer(): void {
     return;
   }
 
-  log(`Registered ${QUEUE_PATH} and ${RESULT_PATH} on Zotero.Server.Endpoints.`);
-
-  // Give Zotero's HTTP server a moment to be listening (it may not be up
-  // yet this early in startup), then confirm the route actually answers.
-  setTimeout(() => {
-    void selfTestQueueEndpoint();
-  }, 5000);
-}
-
-/**
- * Performs a real GET http://127.0.0.1:<port>/batchopen/queue and checks
- * for a well-formed response. This is the only way to know the endpoint is
- * truly reachable (registration can "succeed" against the map while the
- * server itself is down, on a different port, or blocking the request).
- */
-export async function selfTestQueueEndpoint(
-  port: number = CONNECTOR_PORT,
-): Promise<boolean> {
-  try {
-    const resp = await fetch(`http://127.0.0.1:${port}${QUEUE_PATH}`, {
-      method: "GET",
-    });
-    if (!resp.ok) {
-      log(`SELF-TEST FAILED: GET ${QUEUE_PATH} returned HTTP ${resp.status}.`);
-      return false;
-    }
-    const body = await resp.json();
-    if (!body || !Array.isArray((body as { jobs?: unknown }).jobs)) {
-      log(
-        `SELF-TEST FAILED: GET ${QUEUE_PATH} returned 200 but with an unexpected body shape: ` +
-          `${JSON.stringify(body)}`,
-      );
-      return false;
-    }
-    log(`SELF-TEST PASSED: GET ${QUEUE_PATH} is reachable and returns {jobs:[...]}.`);
-    return true;
-  } catch (error) {
-    log(
-      `SELF-TEST FAILED: GET ${QUEUE_PATH} threw (server likely not listening, or blocked): ${error}. ` +
-        `The remote trigger is UNAVAILABLE.`,
-    );
-    return false;
-  }
+  log(
+    `Registered ${QUEUE_PATH} and ${RESULT_PATH} on Zotero.Server.Endpoints.`,
+  );
+  log(
+    "Registration succeeded; awaiting the first poll from the browser connector. " +
+      "(A prior version of this line ran its own loopback fetch() as a self-test; " +
+      "Zotero blocks that request internally, so it always reported the endpoint " +
+      "as unreachable even while external clients — the actual browser connector — " +
+      "were fetching it successfully. That self-test has been removed rather than " +
+      "trusted.)",
+  );
 }
 
 // ---------------------------------------------------------------------
 // GET /batchopen/queue
 // ---------------------------------------------------------------------
 
+export interface QueueEndpointOptions {
+  query?: Record<string, string>;
+}
+
 export const QueueEndpoint = function (this: unknown) {} as unknown as {
-  new (): { init: (options: unknown) => Promise<[number, string, string]> };
+  new (): {
+    init: (options: QueueEndpointOptions) => Promise<[number, string, string]>;
+  };
 };
 
 QueueEndpoint.prototype = {
   supportedMethods: ["GET"],
   permitBookmarklet: false,
 
-  init: async function (): Promise<[number, string, string]> {
+  // A poller that wakes for a single bounded unit of work at a time (as the
+  // zotero-connectors MV3 poller now does, to survive service-worker
+  // eviction) can pass ?max=1 to avoid claiming a full batch of jobs it has
+  // no intention of processing before its next wake.
+  init: async function (
+    options: QueueEndpointOptions,
+  ): Promise<[number, string, string]> {
     try {
-      const jobs: QueuedJob[] = jobQueue.takeBatch(DEFAULT_BATCH_SIZE);
+      let batchSize = DEFAULT_BATCH_SIZE;
+      const rawMax = options?.query?.max;
+      if (rawMax !== undefined) {
+        const parsed = Number.parseInt(rawMax, 10);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          batchSize = Math.min(parsed, DEFAULT_BATCH_SIZE);
+        }
+      }
+      const jobs: QueuedJob[] = jobQueue.takeBatch(batchSize);
       log(`GET ${QUEUE_PATH} -> ${jobs.length} job(s) handed out`);
       return [200, "application/json", JSON.stringify({ jobs })];
     } catch (error) {
       log(`GET ${QUEUE_PATH} handler threw: ${error}`);
-      return [500, "application/json", JSON.stringify({ error: String(error) })];
+      return [
+        500,
+        "application/json",
+        JSON.stringify({ error: String(error) }),
+      ];
     }
   },
 };
@@ -289,7 +291,10 @@ export async function applyResult(
       const attachmentIds = saved.getAttachments();
       for (const attId of attachmentIds) {
         const attachment = deps.getItem(attId);
-        if (!attachment || !isFileAttachment(attachment, deps.linkedUrlLinkMode)) {
+        if (
+          !attachment ||
+          !isFileAttachment(attachment, deps.linkedUrlLinkMode)
+        ) {
           continue;
         }
         attachment.parentID = original.id;
@@ -310,7 +315,9 @@ export async function applyResult(
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     jobQueue.fail(payload.jobId, msg);
-    log(`POST ${RESULT_PATH} jobId=${payload.jobId} itemKey=${job.itemKey} error applying result: ${msg}`);
+    log(
+      `POST ${RESULT_PATH} jobId=${payload.jobId} itemKey=${job.itemKey} error applying result: ${msg}`,
+    );
     return { ok: false, filesMoved: 0, itemsTrashed: 0, error: msg };
   }
 }
@@ -325,11 +332,15 @@ function liveApplyResultDeps(): ApplyResultDeps {
       const item = ZoteroItems.get(id);
       return item ? item : null;
     },
-    trash: (id: number) => (Zotero.Items as unknown as { trash(id: number): Promise<unknown> }).trash(id),
+    trash: (id: number) =>
+      (
+        Zotero.Items as unknown as { trash(id: number): Promise<unknown> }
+      ).trash(id),
     linkedUrlLinkMode: (() => {
       try {
-        const value = (Zotero.Attachments as unknown as { LINK_MODE_LINKED_URL?: number })
-          ?.LINK_MODE_LINKED_URL;
+        const value = (
+          Zotero.Attachments as unknown as { LINK_MODE_LINKED_URL?: number }
+        )?.LINK_MODE_LINKED_URL;
         return typeof value === "number" ? value : 3;
       } catch {
         return 3;
@@ -339,7 +350,9 @@ function liveApplyResultDeps(): ApplyResultDeps {
 }
 
 export const ResultEndpoint = function (this: unknown) {} as unknown as {
-  new (): { init: (options: { data?: unknown }) => Promise<[number, string, string]> };
+  new (): {
+    init: (options: { data?: unknown }) => Promise<[number, string, string]>;
+  };
 };
 
 ResultEndpoint.prototype = {
@@ -347,17 +360,27 @@ ResultEndpoint.prototype = {
   supportedDataTypes: ["application/json"],
   permitBookmarklet: false,
 
-  init: async function (options: { data?: unknown }): Promise<[number, string, string]> {
+  init: async function (options: {
+    data?: unknown;
+  }): Promise<[number, string, string]> {
     try {
       const payload = options?.data as ResultPayload | undefined;
       if (!payload || typeof payload.jobId !== "string") {
-        return [400, "application/json", JSON.stringify({ error: "missing jobId" })];
+        return [
+          400,
+          "application/json",
+          JSON.stringify({ error: "missing jobId" }),
+        ];
       }
       const outcome = await applyResult(payload, liveApplyResultDeps());
       return [200, "application/json", JSON.stringify(outcome)];
     } catch (error) {
       log(`POST ${RESULT_PATH} handler threw: ${error}`);
-      return [500, "application/json", JSON.stringify({ error: String(error) })];
+      return [
+        500,
+        "application/json",
+        JSON.stringify({ error: String(error) }),
+      ];
     }
   },
 };
@@ -383,6 +406,7 @@ export interface EnqueueResult {
   skippedHasPdf: number;
   skippedNoUrl: number;
   skippedNotRegular: number;
+  skippedAlreadyQueued: number;
 }
 
 /**
@@ -391,23 +415,35 @@ export interface EnqueueResult {
  * attachment url; no search fallback — there is nothing useful to save from
  * a search results page) and enqueue it. Returns counts for the on-screen
  * summary.
+ *
+ * Deduplicates on (libraryID, itemKey): an item that already has a pending
+ * or in-flight job is skipped rather than enqueued again, so re-running
+ * this command on the same selection (e.g. because the connector poller
+ * had not yet started) does not pile up duplicate jobs for the same item.
  */
 export function enqueueSelectedItems(
   selected: EnqueueSelectableItem[],
   itemLookup: EnqueueItemLookup,
   linkedUrlLinkMode: number,
 ): EnqueueResult {
-  const { regularItems, skippedCount: skippedNotRegular } = splitSelection(selected);
+  const { regularItems, skippedCount: skippedNotRegular } =
+    splitSelection(selected);
 
   let enqueued = 0;
   let skippedHasPdf = 0;
   let skippedNoUrl = 0;
+  let skippedAlreadyQueued = 0;
 
   for (const item of regularItems) {
     if (!item.key) {
       // Not yet saved (no persistent key) — nothing stable to reconcile
       // the connector's result back onto later; skip it rather than guess.
       skippedNoUrl += 1;
+      continue;
+    }
+
+    if (jobQueue.hasActiveJobForItem(item.libraryID, item.key)) {
+      skippedAlreadyQueued += 1;
       continue;
     }
 
@@ -440,5 +476,31 @@ export function enqueueSelectedItems(
     enqueued += 1;
   }
 
-  return { enqueued, skippedHasPdf, skippedNoUrl, skippedNotRegular };
+  return {
+    enqueued,
+    skippedHasPdf,
+    skippedNoUrl,
+    skippedNotRegular,
+    skippedAlreadyQueued,
+  };
+}
+
+// ---------------------------------------------------------------------
+// "Clear the connector queue" menu command
+// ---------------------------------------------------------------------
+
+export interface ClearQueueResult {
+  pendingCleared: number;
+  inFlightCleared: number;
+  totalCleared: number;
+}
+
+/** Empties pending and in-flight jobs so a stuck queue is recoverable without restarting Zotero. */
+export function clearConnectorQueue(): ClearQueueResult {
+  const { pendingCleared, inFlightCleared } = jobQueue.clear();
+  const totalCleared = pendingCleared + inFlightCleared;
+  log(
+    `Cleared connector queue: pending=${pendingCleared} in-flight=${inFlightCleared} total=${totalCleared}`,
+  );
+  return { pendingCleared, inFlightCleared, totalCleared };
 }

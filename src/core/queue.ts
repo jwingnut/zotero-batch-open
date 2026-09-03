@@ -148,6 +148,48 @@ export class JobQueue {
     return this.jobs.get(jobId);
   }
 
+  /**
+   * True if a pending or in-flight job already exists for this
+   * (libraryID, itemKey) pair — used to dedupe on enqueue so re-running
+   * "Save selected via connector" on the same selection does not pile up
+   * duplicate jobs for the same item.
+   */
+  hasActiveJobForItem(libraryID: number, itemKey: string): boolean {
+    for (const job of this.jobs.values()) {
+      if (
+        job.libraryID === libraryID &&
+        job.itemKey === itemKey &&
+        (job.status === "pending" || job.status === "in-flight")
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Empties all pending and in-flight jobs (used by the "Clear the
+   * connector queue" command to recover from a stuck state without
+   * restarting Zotero). Done/failed jobs are left in place — they are
+   * already inert and kept only for get()-based lookups shortly after
+   * completion.
+   */
+  clear(): { pendingCleared: number; inFlightCleared: number } {
+    let pendingCleared = 0;
+    let inFlightCleared = 0;
+    for (const [id, job] of this.jobs) {
+      if (job.status === "pending") {
+        pendingCleared += 1;
+        this.jobs.delete(id);
+      } else if (job.status === "in-flight") {
+        inFlightCleared += 1;
+        this.jobs.delete(id);
+      }
+    }
+    this.pendingOrder = this.pendingOrder.filter((id) => this.jobs.has(id));
+    return { pendingCleared, inFlightCleared };
+  }
+
   pendingCount(): number {
     return this.pendingOrder.filter((id) => {
       const job = this.jobs.get(id);

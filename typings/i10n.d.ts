@@ -3,6 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 export type FluentMessageId =
+  | 'batchopen-menu-clear-connector-queue'
   | 'batchopen-menu-open-browser'
   | 'batchopen-menu-open-browser-missing-pdf'
   | 'batchopen-menu-reconcile-attachments'

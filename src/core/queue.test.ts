@@ -20,7 +20,11 @@ describe("JobQueue", () => {
   it("enqueues jobs and hands out at most batchSize pending jobs", () => {
     const q = new JobQueue({ idGenerator: idGen() });
     for (let i = 0; i < 5; i++) {
-      q.enqueue({ url: `https://example.com/${i}`, itemKey: `K${i}`, libraryID: 1 });
+      q.enqueue({
+        url: `https://example.com/${i}`,
+        itemKey: `K${i}`,
+        libraryID: 1,
+      });
     }
 
     const batch1 = q.takeBatch(3);

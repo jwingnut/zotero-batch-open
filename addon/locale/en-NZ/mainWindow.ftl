@@ -16,3 +16,5 @@ batchopen-menu-reconcile-attachments =
     .label = Attach newly saved files to the selected items
 batchopen-menu-save-via-connector =
     .label = Save selected via connector
+batchopen-menu-clear-connector-queue =
+    .label = Clear the connector queue

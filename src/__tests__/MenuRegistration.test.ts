@@ -61,10 +61,11 @@ describe("MenuRegistration (Zotero 8+ MenuManager)", () => {
     expect(typeof root.onShowing).toBe("function");
 
     const actions = root.menus ?? [];
-    expect(actions).toHaveLength(6);
+    expect(actions).toHaveLength(7);
     expect(actions.every((m) => m.menuType === "menuitem")).toBe(true);
     expect(actions.every((m) => typeof m.onShowing === "function")).toBe(true);
     expect(actions.map((m) => m.l10nID)).toEqual([
+      undefined,
       undefined,
       undefined,
       undefined,
@@ -79,6 +80,7 @@ describe("MenuRegistration (Zotero 8+ MenuManager)", () => {
       "Open all in browser (only those missing a PDF)",
       "Attach newly saved files to the selected items",
       "Save selected via connector",
+      "Clear the connector queue",
     ]);
   });
 
@@ -114,7 +116,7 @@ describe("MenuRegistration (Zotero 8+ MenuManager)", () => {
     const logged = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
     expect(logged).toContain("falling back to l10nID path");
     expect(logged).toContain(
-      "Registered menus using MenuManager API (path=l10nID-fallback, l10nID=true, entries=7)",
+      "Registered menus using MenuManager API (path=l10nID-fallback, l10nID=true, entries=8)",
     );
 
     Zotero.MenuManager.registerMenu = original;
@@ -133,7 +135,7 @@ describe("MenuRegistration (Zotero 8+ MenuManager)", () => {
 
     const logged = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
     expect(logged).toContain(
-      "Registered menus using MenuManager API (path=label-only, l10nID=false, entries=7)",
+      "Registered menus using MenuManager API (path=label-only, l10nID=false, entries=8)",
     );
 
     logSpy.mockRestore();
