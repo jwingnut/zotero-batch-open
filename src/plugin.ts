@@ -19,6 +19,8 @@ import {
 } from "@/core/urlResolution";
 import { shouldConfirm, confirmPromptMessage } from "@/core/confirm";
 import type { AddonData } from "@/shared/types";
+import { appendLogLine } from "@/utils/fileLog";
+import { getPreferredLocale } from "@/utils/locale";
 
 type CommandKind = "open" | "scholar" | "web";
 
@@ -66,7 +68,7 @@ export class BatchOpenPlugin {
 
   async init(data: AddonData): Promise<void> {
     this.addonData = data;
-    this.log(`${this.version()} starting`);
+    this.log(`${this.version()} starting; locale=${getPreferredLocale()}`);
     await this.registerMenus();
   }
 
@@ -245,39 +247,70 @@ export class BatchOpenPlugin {
       };
     };
 
-    const actionMenus: Zotero.MenuManager.MenuData[] =
-      LIBRARY_ITEM_MENU_L10N_IDS.map((l10nID, i) => ({
-        menuType: "menuitem" as const,
-        l10nID,
-        onShowing: safeOnShowing(LIBRARY_ITEM_MENU_LABELS[i]),
-        onCommand: () => {
-          this.guard(`onCommand(${commands[i]})`, () =>
-            this.runCommand(commands[i]),
-          );
+    // Build the menu tree with or without `l10nID`. Menu labels are always
+    // set directly in `onShowing` (ctx.menuElem.setAttribute("label", …)),
+    // so `l10nID` is not required for the menu to be usable — but it is the
+    // only other label-bearing field MenuData exposes (see typings/zotero.d.ts),
+    // so it's kept as a fallback in case some Zotero build rejects a menu
+    // entry that carries neither a label nor an l10nID while building it.
+    const buildMenus = (withL10nID: boolean): Zotero.MenuManager.MenuData[] => {
+      const actionMenus: Zotero.MenuManager.MenuData[] =
+        LIBRARY_ITEM_MENU_LABELS.map((label, i) => ({
+          menuType: "menuitem" as const,
+          ...(withL10nID ? { l10nID: LIBRARY_ITEM_MENU_L10N_IDS[i] } : {}),
+          onShowing: safeOnShowing(label),
+          onCommand: () => {
+            this.guard(`onCommand(${commands[i]})`, () =>
+              this.runCommand(commands[i]),
+            );
+          },
+        }));
+
+      return [
+        {
+          menuType: "submenu",
+          ...(withL10nID ? { l10nID: LIBRARY_ITEM_SUBMENU_L10N_ID } : {}),
+          onShowing: safeOnShowing(SUBMENU_LABEL),
+          menus: actionMenus,
         },
-      }));
+      ];
+    };
 
-    const menus: Zotero.MenuManager.MenuData[] = [
-      {
-        menuType: "submenu",
-        l10nID: LIBRARY_ITEM_SUBMENU_L10N_ID,
-        onShowing: safeOnShowing(SUBMENU_LABEL),
-        menus: actionMenus,
-      },
-    ];
+    const entryCount = LIBRARY_ITEM_MENU_LABELS.length + 1; // + the submenu itself
+    const registerWith = (withL10nID: boolean): string | false =>
+      Zotero.MenuManager.registerMenu({
+        menuID,
+        pluginID,
+        target: "main/library/item",
+        menus: buildMenus(withL10nID),
+      });
 
-    const registered = Zotero.MenuManager.registerMenu({
-      menuID,
-      pluginID,
-      target: "main/library/item",
-      menus,
-    });
+    let registered: string | false;
+    let usedL10nID: boolean;
+    try {
+      // First run: no l10nID, so nothing needs to translate for the menu to
+      // build — this is the path that avoids the locale-resolution failure
+      // that a non-en-US locale chain previously triggered.
+      registered = registerWith(false);
+      usedL10nID = false;
+    } catch (error) {
+      this.log(
+        `Menu registration: label-only path (no l10nID) threw; falling back to l10nID path: ${error}`,
+      );
+      registered = registerWith(true);
+      usedL10nID = true;
+    }
 
+    const path = usedL10nID ? "l10nID-fallback" : "label-only";
     if (registered !== false) {
       this.menuManagerRegistered = true;
-      this.log("Registered menus using MenuManager API");
+      this.log(
+        `Registered menus using MenuManager API (path=${path}, l10nID=${usedL10nID}, entries=${entryCount})`,
+      );
     } else {
-      this.log("MenuManager.registerMenu returned false; menus unavailable");
+      this.log(
+        `MenuManager.registerMenu returned false (path=${path}); menus unavailable`,
+      );
     }
   }
 
@@ -685,5 +718,6 @@ export class BatchOpenPlugin {
     } else {
       console.log(`Batch Open: ${message}`);
     }
+    appendLogLine(message);
   }
 }

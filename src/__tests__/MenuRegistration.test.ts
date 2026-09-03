@@ -37,7 +37,7 @@ function getMenuUnregisterCalls(): string[] {
 }
 
 describe("MenuRegistration (Zotero 8+ MenuManager)", () => {
-  it("calls registerMenu with menuID, pluginID, target, and menu items with onShowing labels", async () => {
+  it("calls registerMenu with menuID, pluginID, target, and menu items with onShowing labels, and no l10nID on the first (default) path", async () => {
     const plugin = new BatchOpenPlugin();
     await plugin.init({
       id: "batch-open@jwhitney",
@@ -54,7 +54,10 @@ describe("MenuRegistration (Zotero 8+ MenuManager)", () => {
 
     const root = calls[0].menus[0];
     expect(root.menuType).toBe("submenu");
-    expect(root.l10nID).toBe("batchopen-submenu");
+    // Menu labels no longer depend on locale resolution: on the default
+    // (label-only) path, l10nID is omitted entirely and onShowing sets the
+    // label directly.
+    expect(root.l10nID).toBeUndefined();
     expect(typeof root.onShowing).toBe("function");
 
     const actions = root.menus ?? [];
@@ -62,15 +65,72 @@ describe("MenuRegistration (Zotero 8+ MenuManager)", () => {
     expect(actions.every((m) => m.menuType === "menuitem")).toBe(true);
     expect(actions.every((m) => typeof m.onShowing === "function")).toBe(true);
     expect(actions.map((m) => m.l10nID)).toEqual([
-      "batchopen-menu-open-browser",
-      "batchopen-menu-search-scholar",
-      "batchopen-menu-search-web",
+      undefined,
+      undefined,
+      undefined,
     ]);
     expect(LIBRARY_ITEM_MENU_LABELS).toEqual([
       "Open all in browser",
       "Search all in Google Scholar",
       "Search all in web search",
     ]);
+  });
+
+  it("falls back to registering with l10nID when the label-only registration throws", async () => {
+    const original = Zotero.MenuManager.registerMenu;
+    const seenCalls: MenuRegisterCall[] = [];
+    let callCount = 0;
+    Zotero.MenuManager.registerMenu = ((options: MenuRegisterCall) => {
+      seenCalls.push(options);
+      callCount += 1;
+      if (callCount === 1) {
+        throw new Error("l10nID unresolvable in this locale chain");
+      }
+      return options.menuID;
+    }) as typeof Zotero.MenuManager.registerMenu;
+
+    const logSpy = vi.spyOn(Zotero, "log");
+
+    const plugin = new BatchOpenPlugin();
+    await plugin.init({
+      id: "batch-open@jwhitney",
+      version: "0.1.4",
+      rootURI: "",
+    });
+
+    expect(callCount).toBe(2);
+    expect(seenCalls[0].menus[0].l10nID).toBeUndefined();
+    expect(seenCalls[1].menus[0].l10nID).toBe("batchopen-submenu");
+    expect((seenCalls[1].menus[0].menus ?? [])[0].l10nID).toBe(
+      "batchopen-menu-open-browser",
+    );
+
+    const logged = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(logged).toContain("falling back to l10nID path");
+    expect(logged).toContain(
+      "Registered menus using MenuManager API (path=l10nID-fallback, l10nID=true, entries=4)",
+    );
+
+    Zotero.MenuManager.registerMenu = original;
+    logSpy.mockRestore();
+  });
+
+  it("reports the label-only path in the log when the default registration succeeds", async () => {
+    const logSpy = vi.spyOn(Zotero, "log");
+
+    const plugin = new BatchOpenPlugin();
+    await plugin.init({
+      id: "batch-open@jwhitney",
+      version: "0.1.4",
+      rootURI: "",
+    });
+
+    const logged = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(logged).toContain(
+      "Registered menus using MenuManager API (path=label-only, l10nID=false, entries=4)",
+    );
+
+    logSpy.mockRestore();
   });
 
   it("shutdown does not call unregisterMenu (Zotero clears plugin menus on addon shutdown)", async () => {

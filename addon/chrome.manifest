@@ -1,2 +1,6 @@
 content batch-open content/
 locale batch-open en-US locale/en-US/
+locale batch-open en-GB locale/en-GB/
+locale batch-open en-AU locale/en-AU/
+locale batch-open en-CA locale/en-CA/
+locale batch-open en-NZ locale/en-NZ/

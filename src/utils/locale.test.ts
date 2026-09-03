@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { registerWindowFluent } from "@/utils/locale";
+import { registerWindowFluent, getPreferredLocale } from "@/utils/locale";
 
 function fakeAddon(ref = "batch-open") {
   (globalThis as unknown as { addon: unknown }).addon = {
@@ -43,5 +43,46 @@ describe("registerWindowFluent", () => {
     } as unknown as Window;
 
     expect(() => registerWindowFluent(win)).not.toThrow();
+  });
+});
+
+describe("getPreferredLocale", () => {
+  const testGlobal = globalThis as unknown as {
+    Zotero: { locale?: string };
+    Services: { locale?: { appLocaleAsBCP47?: string } };
+  };
+
+  it("prefers Zotero.locale when it is a non-empty string", () => {
+    testGlobal.Zotero.locale = "en-AU";
+    testGlobal.Services.locale = { appLocaleAsBCP47: "en-NZ" };
+
+    expect(getPreferredLocale()).toBe("en-AU");
+
+    delete testGlobal.Zotero.locale;
+  });
+
+  it("falls back to Services.locale.appLocaleAsBCP47 when Zotero.locale is absent", () => {
+    delete testGlobal.Zotero.locale;
+    testGlobal.Services.locale = { appLocaleAsBCP47: "en-CA" };
+
+    expect(getPreferredLocale()).toBe("en-CA");
+  });
+
+  it("falls back to en-US when nothing else resolves", () => {
+    delete testGlobal.Zotero.locale;
+    testGlobal.Services.locale = undefined;
+
+    expect(getPreferredLocale()).toBe("en-US");
+  });
+
+  it("ignores a non-string Zotero.locale (some Zotero versions expose an object)", () => {
+    (testGlobal.Zotero as unknown as { locale?: unknown }).locale = {
+      locale: "en-GB",
+    };
+    testGlobal.Services.locale = { appLocaleAsBCP47: "en-GB" };
+
+    expect(getPreferredLocale()).toBe("en-GB");
+
+    delete (testGlobal.Zotero as unknown as { locale?: unknown }).locale;
   });
 });

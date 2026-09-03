@@ -95,7 +95,30 @@ declare global {
     function launchURL(url: string): void;
 
     const platformMajorVersion: number;
+
+    /** The directory holding the user's Zotero library (zotero.sqlite, storage/, etc). */
+    namespace DataDirectory {
+      let dir: string;
+    }
+
+    /** Fallback location when DataDirectory is unavailable (e.g. mid-startup). */
+    function getProfileDirectory(): { path: string };
   }
+
+  /** Firefox privileged-JS file I/O API (Firefox 115+ / Zotero 7+). */
+  const IOUtils: {
+    readUTF8(path: string): Promise<string>;
+    writeUTF8(
+      path: string,
+      data: string,
+      options?: Record<string, unknown>,
+    ): Promise<number>;
+  };
+
+  /** Firefox privileged-JS path-joining helper (Firefox 115+ / Zotero 7+). */
+  const PathUtils: {
+    join(...parts: string[]): string;
+  };
 
   // Firefox/XUL global interfaces
   const Cc: nsIXPCComponents_Classes;

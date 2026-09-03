@@ -1,6 +1,13 @@
 import pkg from "../package.json";
 import { BatchOpenPlugin } from "./plugin";
 import { registerWindowFluent } from "@/utils/locale";
+import {
+  appendLogLine,
+  installUnhandledRejectionLogger,
+} from "@/utils/fileLog";
+
+/** Per-window unhandledrejection cleanup functions, removed on unload. */
+const unhandledRejectionCleanups = new WeakMap<Window, () => void>();
 
 async function onStartup(): Promise<void> {
   await Promise.all([
@@ -44,10 +51,22 @@ async function onStartup(): Promise<void> {
 
 async function onMainWindowLoad(win: Window): Promise<void> {
   registerWindowFluent(win);
+  try {
+    unhandledRejectionCleanups.set(win, installUnhandledRejectionLogger(win));
+  } catch (error) {
+    appendLogLine(`Failed to install unhandledrejection logger: ${error}`);
+  }
   await addon.data.plugin?.onMainWindowReady(win);
 }
 
-async function onMainWindowUnload(_win: Window): Promise<void> {
+async function onMainWindowUnload(win: Window): Promise<void> {
+  try {
+    unhandledRejectionCleanups.get(win)?.();
+  } catch {
+    // Never let cleanup itself throw.
+  } finally {
+    unhandledRejectionCleanups.delete(win);
+  }
   ztoolkit.unregisterAll();
 }
 

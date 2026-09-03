@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Batch Open",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Open or search the selected items in your browser, in bulk.",
   "author": "Jason Whitney",
   "homepage_url": "https://github.com/jwingnut/zotero-batch-open",
