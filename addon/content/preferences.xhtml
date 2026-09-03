@@ -84,5 +84,45 @@
       to your library within this many minutes ago when searching for a
       connector-created duplicate to merge.
     </description>
+
+    <separator />
+
+    <checkbox
+      label="Reconcile items saved via the connector remote trigger"
+      preference="extensions.zotero.batchopen.reconcileSavedItems"
+    />
+    <description class="tip">
+      When on (the default), a "Save selected via connector" job moves the
+      saved PDF onto the item you already had and trashes the new duplicate
+      -- this keeps that item's collections, tags, notes, and its Better
+      BibTeX citation key intact. Turn it off if you use a duplicate-merging
+      plugin (e.g. Zoplicate) instead: the new item is then left as-is for
+      that plugin to merge on its own schedule, but which item survives a
+      merge -- and so whether a citation key changes -- is then that
+      plugin's decision, not this one's. If you cite from Zotero into a
+      manuscript via Better BibTeX, an unexpected citation-key change is
+      usually more disruptive than a duplicate sitting in your library
+      briefly, which is why this defaults to on.
+    </description>
+
+    <hbox align="center">
+      <label
+        value="Wait for the saved file (ms):"
+        control="batchopen-pref-attachment-wait"
+      />
+      <html:input
+        id="batchopen-pref-attachment-wait"
+        type="number"
+        min="1000"
+        max="300000"
+        preference="extensions.zotero.batchopen.attachmentWaitMs"
+      />
+    </hbox>
+    <description class="tip">
+      Zotero saves a new item's file a moment after the item itself appears,
+      so reconciling waits up to this long (polling in the background) for
+      it to show up before giving up. Only used when reconciliation (above)
+      is on.
+    </description>
   </groupbox>
 </vbox>

@@ -12,6 +12,8 @@ declare namespace _ZoteroTypes {
       "confirmAbove": number;
       "delayMs": number;
       "reconcileWindowMinutes": number;
+      "reconcileSavedItems": boolean;
+      "attachmentWaitMs": number;
     };
   }
 }

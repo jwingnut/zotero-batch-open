@@ -65,6 +65,8 @@ const PREF = {
   confirmAbove: "extensions.zotero.batchopen.confirmAbove",
   delayMs: "extensions.zotero.batchopen.delayMs",
   reconcileWindowMinutes: "extensions.zotero.batchopen.reconcileWindowMinutes",
+  reconcileSavedItems: "extensions.zotero.batchopen.reconcileSavedItems",
+  attachmentWaitMs: "extensions.zotero.batchopen.attachmentWaitMs",
 } as const;
 
 interface SourceCounts {
@@ -991,7 +993,11 @@ export class BatchOpenPlugin {
     }
 
     const linkedUrlMode = this.linkedUrlLinkMode();
-    const result = enqueueSelectedItems(selected, Zotero.Items, linkedUrlMode);
+    const result = await enqueueSelectedItems(
+      selected,
+      Zotero.Items,
+      linkedUrlMode,
+    );
 
     this.log(
       `save-connector: enqueued=${result.enqueued} skippedHasPdf=${result.skippedHasPdf} ` +

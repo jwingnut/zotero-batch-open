@@ -25,7 +25,17 @@ import {
   type AttachmentRef,
 } from "@/core/attachments";
 import { resolveOpenUrl } from "@/core/urlResolution";
-import { JobQueue, type QueuedJob } from "@/core/queue";
+import {
+  isKnownRedirectorUrl,
+  resolveRedirectorUrl,
+} from "@/core/redirectResolver";
+import { JobQueue, type QueuedJob, type Job } from "@/core/queue";
+import type { MatchRule } from "@/core/duplicateMatch";
+import {
+  selectCandidates,
+  planReconciliation,
+  parseZoteroDateAddedMs,
+} from "@/core/reconcile";
 import { appendLogLine } from "@/utils/fileLog";
 
 /** Max jobs handed out per GET /batchopen/queue call. */
@@ -33,12 +43,19 @@ export const DEFAULT_BATCH_SIZE = 25;
 
 const QUEUE_PATH = "/batchopen/queue";
 const RESULT_PATH = "/batchopen/result";
+const STATUS_PATH = "/batchopen/status";
 
 export interface ResultPayload {
   jobId: string;
   ok: boolean;
   savedItemKeys?: string[];
   error?: string;
+  /**
+   * Free-text diagnostics from the connector (redirect trail, which
+   * save path was used -- translator/PDF/snapshot, etc.). See
+   * batchOpenQueue.js's _reportResult(). Purely for the log.
+   */
+  detail?: string;
 }
 
 function log(message: string): void {
@@ -97,6 +114,7 @@ export function registerEndpointsOnRegistry(
   try {
     registry[QUEUE_PATH] = QueueEndpoint;
     registry[RESULT_PATH] = ResultEndpoint;
+    registry[STATUS_PATH] = StatusEndpoint;
   } catch (error) {
     return {
       registered: false,
@@ -106,10 +124,11 @@ export function registerEndpointsOnRegistry(
 
   const queueOk = registry[QUEUE_PATH] === QueueEndpoint;
   const resultOk = registry[RESULT_PATH] === ResultEndpoint;
-  if (!queueOk || !resultOk) {
+  const statusOk = registry[STATUS_PATH] === StatusEndpoint;
+  if (!queueOk || !resultOk || !statusOk) {
     return {
       registered: false,
-      reason: `read-back mismatch (queue=${queueOk}, result=${resultOk}); another plugin may have overwritten the same path`,
+      reason: `read-back mismatch (queue=${queueOk}, result=${resultOk}, status=${statusOk}); another plugin may have overwritten the same path`,
     };
   }
 
@@ -148,7 +167,7 @@ export function registerQueueServer(): void {
   }
 
   log(
-    `Registered ${QUEUE_PATH} and ${RESULT_PATH} on Zotero.Server.Endpoints.`,
+    `Registered ${QUEUE_PATH}, ${RESULT_PATH}, and ${STATUS_PATH} on Zotero.Server.Endpoints.`,
   );
   log(
     "Registration succeeded; awaiting the first poll from the browser connector. " +
@@ -280,6 +299,46 @@ QueueEndpoint.prototype = {
 };
 
 // ---------------------------------------------------------------------
+// GET /batchopen/status
+// ---------------------------------------------------------------------
+
+/**
+ * Read-only queue depth for the connector's preferences pane -- unlike
+ * GET /batchopen/queue, this never claims a job. Added so a poller that has
+ * stopped (for any reason) still shows waiting work at a glance instead of
+ * looking identical to "nothing queued" (see the 2026-09 incident this was
+ * added for: a halted poller with jobs piling up looked, from the options
+ * page, exactly like a working poller with nothing to do).
+ */
+export const StatusEndpoint = function (this: unknown) {} as unknown as {
+  new (): {
+    init: () => Promise<[number, string, string]>;
+  };
+};
+
+StatusEndpoint.prototype = {
+  supportedMethods: ["GET"],
+  permitBookmarklet: false,
+
+  init: async function (): Promise<[number, string, string]> {
+    try {
+      const body = {
+        pending: jobQueue.pendingCount(),
+        inFlight: jobQueue.inFlightCount(),
+      };
+      return [200, "application/json", JSON.stringify(body)];
+    } catch (error) {
+      log(`GET ${STATUS_PATH} handler threw: ${error}`);
+      return [
+        500,
+        "application/json",
+        JSON.stringify({ error: String(error) }),
+      ];
+    }
+  },
+};
+
+// ---------------------------------------------------------------------
 // POST /batchopen/result
 // ---------------------------------------------------------------------
 
@@ -294,8 +353,15 @@ export interface ZoteroItemLike extends AttachmentRef {
   libraryID: number;
   parentID?: number | false;
   isRegularItem(): boolean;
+  isTopLevelItem(): boolean;
   getAttachments(): number[];
+  getField(field: string): string;
   saveTx(): Promise<unknown>;
+}
+
+export interface FoundDuplicate {
+  item: ZoteroItemLike;
+  rule: MatchRule;
 }
 
 export interface ApplyResultDeps {
@@ -303,6 +369,24 @@ export interface ApplyResultDeps {
   getItem(id: number): ZoteroItemLike | null;
   trash(id: number): Promise<unknown>;
   linkedUrlLinkMode: number;
+  /** extensions.zotero.batchopen.reconcileSavedItems. Default true. */
+  reconcileEnabled: boolean;
+  /** extensions.zotero.batchopen.attachmentWaitMs. Default 60000. */
+  attachmentWaitMs: number;
+  /** How often to re-check for the attachment while waiting. */
+  pollIntervalMs: number;
+  now(): number;
+  sleep(ms: number): Promise<void>;
+  /**
+   * Fallback duplicate lookup (src/core/duplicateMatch.ts via reconcile.ts's
+   * selectCandidates/planReconciliation) used when the connector reported no
+   * savedItemKeys, or the keyed item(s) never gained a file attachment
+   * within attachmentWaitMs. Scoped to items added at/after windowStartMs.
+   */
+  findDuplicate(
+    original: ZoteroItemLike,
+    windowStartMs: number,
+  ): FoundDuplicate | null;
 }
 
 export interface ApplyResultOutcome {
@@ -310,14 +394,54 @@ export interface ApplyResultOutcome {
   filesMoved: number;
   itemsTrashed: number;
   error?: string;
+  /**
+   * True when reconciliation is still running in the background (see
+   * reconcileInBackground below) -- this response returned before it
+   * finished, so filesMoved/itemsTrashed here are not yet final. The
+   * eventual outcome is logged, not returned (nothing awaits this).
+   */
+  pending?: boolean;
+}
+
+function moveFileAttachments(
+  saved: ZoteroItemLike,
+  original: ZoteroItemLike,
+  deps: ApplyResultDeps,
+): Promise<number> {
+  return (async () => {
+    let moved = 0;
+    for (const attId of saved.getAttachments()) {
+      const attachment = deps.getItem(attId);
+      if (!attachment || !isFileAttachment(attachment, deps.linkedUrlLinkMode)) {
+        continue;
+      }
+      attachment.parentID = original.id;
+      await attachment.saveTx();
+      moved += 1;
+    }
+    return moved;
+  })();
 }
 
 /**
  * The result-handling logic, factored out from the Zotero.Server.Endpoint
- * wrapper so it's unit-testable against fakes. On success: reparents every
- * stored/imported file attachment from each saved item onto the original
- * (looked up deterministically by itemKey/libraryID — no title matching),
- * then trashes the (now-emptied) saved item. Never permanently deletes.
+ * wrapper so it's unit-testable against fakes.
+ *
+ * A connector-reported failure fails the job synchronously, as before. A
+ * connector-reported success completes the job immediately (the connector's
+ * part -- performing the save -- is done) and, only if reconciliation is
+ * enabled, kicks off reconcileInBackground() WITHOUT awaiting it: the
+ * connector's own POST has a short timeout (see batchOpenQueue.js's
+ * _reportResult()) and reconciliation can legitimately take up to
+ * attachmentWaitMs (Zotero's own saveAttachment for a newly-saved item
+ * finishes visibly after saveItems returns, per the user's connector debug
+ * log) waiting for the new item to gain a stored file. Making the connector
+ * hold its response open that long would either time out client-side or
+ * (worse, on Chrome MV3) rely on an unverified assumption about whether a
+ * pending fetch keeps an extension service worker alive -- exactly the kind
+ * of assumption that already broke this feature once (see batchOpenQueue.js
+ * header). Reconciliation therefore reports its own eventual outcome to the
+ * Zotero-side log independently; the browser never needs to see it.
  */
 export async function applyResult(
   payload: ResultPayload,
@@ -338,58 +462,191 @@ export async function applyResult(
     return { ok: false, filesMoved: 0, itemsTrashed: 0, error: payload.error };
   }
 
-  try {
-    const original = deps.items.getByLibraryAndKey(job.libraryID, job.itemKey);
-    if (!original) {
-      throw new Error(
-        `original item not found for libraryID=${job.libraryID} itemKey=${job.itemKey}`,
-      );
+  // Connector-side save succeeded. That is this job's own work; mark it done
+  // regardless of what reconciliation later finds (a "job" here is "did the
+  // connector save the page", not "did we successfully merge it back").
+  jobQueue.complete(payload.jobId);
+
+  if (!deps.reconcileEnabled) {
+    const keys =
+      payload.savedItemKeys && payload.savedItemKeys.length
+        ? payload.savedItemKeys.join(", ")
+        : "(no keys reported)";
+    log(
+      `POST ${RESULT_PATH} jobId=${payload.jobId} itemKey=${job.itemKey} ` +
+        `OK: saved as new item(s) ${keys}; reconciliation disabled` +
+        (payload.detail ? ` (${payload.detail})` : ""),
+    );
+    return { ok: true, filesMoved: 0, itemsTrashed: 0 };
+  }
+
+  log(
+    `POST ${RESULT_PATH} jobId=${payload.jobId} itemKey=${job.itemKey} ` +
+      `OK: connector save succeeded, reconciling in the background` +
+      (payload.detail ? ` (${payload.detail})` : ""),
+  );
+  reconcileInBackground(payload, job, deps).catch((error) => {
+    log(
+      `POST ${RESULT_PATH} jobId=${payload.jobId} itemKey=${job.itemKey} reconciliation crashed: ${error}`,
+    );
+  });
+
+  return { ok: true, filesMoved: 0, itemsTrashed: 0, pending: true };
+}
+
+/**
+ * Runs after applyResult() has already responded to the connector: waits
+ * (up to deps.attachmentWaitMs, polling every deps.pollIntervalMs) for the
+ * saved item(s) to gain a stored file attachment, moves it onto the
+ * original and trashes the now-emptied saved item, or -- if no keys were
+ * reported at all, or the keyed item(s) never gained a file -- falls back
+ * to deps.findDuplicate() (the same duplicate-matching the manual "Attach
+ * newly saved files" command uses). Never touches the original's existing
+ * attachments; only ever trashes (never permanently deletes) the item the
+ * file was moved off of. Logs its own outcome; returns nothing (callers of
+ * applyResult never await this).
+ */
+export async function reconcileInBackground(
+  payload: ResultPayload,
+  job: Job,
+  deps: ApplyResultDeps,
+): Promise<void> {
+  const logPrefix = `POST ${RESULT_PATH} jobId=${payload.jobId} itemKey=${job.itemKey} reconciliation`;
+
+  const original = deps.items.getByLibraryAndKey(job.libraryID, job.itemKey);
+  if (!original) {
+    log(`${logPrefix} FAILED: original item not found for itemKey=${job.itemKey}`);
+    return;
+  }
+
+  const savedKeys = payload.savedItemKeys || [];
+  let readyKeys: string[] = [];
+
+  if (savedKeys.length > 0) {
+    const deadline = deps.now() + deps.attachmentWaitMs;
+    for (;;) {
+      readyKeys = savedKeys.filter((key) => {
+        const saved = deps.items.getByLibraryAndKey(job.libraryID, key);
+        if (!saved) return false;
+        return saved
+          .getAttachments()
+          .some((id) => {
+            const att = deps.getItem(id);
+            return !!att && isFileAttachment(att, deps.linkedUrlLinkMode);
+          });
+      });
+      if (readyKeys.length > 0 || deps.now() >= deadline) break;
+      await deps.sleep(deps.pollIntervalMs);
     }
+  }
 
-    let filesMoved = 0;
-    let itemsTrashed = 0;
-    const savedKeys = payload.savedItemKeys || [];
+  let filesMoved = 0;
+  let itemsTrashed = 0;
+  let matchedVia: string | null = null;
 
-    for (const savedKey of savedKeys) {
+  if (readyKeys.length > 0) {
+    for (const savedKey of readyKeys) {
       const saved = deps.items.getByLibraryAndKey(job.libraryID, savedKey);
-      if (!saved) {
-        log(
-          `POST ${RESULT_PATH} jobId=${payload.jobId}: saved item key=${savedKey} not found; skipping`,
-        );
-        continue;
+      if (!saved) continue;
+      const movedForThis = await moveFileAttachments(saved, original, deps);
+      filesMoved += movedForThis;
+      if (movedForThis > 0) {
+        await deps.trash(saved.id);
+        itemsTrashed += 1;
       }
-
-      const attachmentIds = saved.getAttachments();
-      for (const attId of attachmentIds) {
-        const attachment = deps.getItem(attId);
-        if (
-          !attachment ||
-          !isFileAttachment(attachment, deps.linkedUrlLinkMode)
-        ) {
-          continue;
-        }
-        attachment.parentID = original.id;
-        await attachment.saveTx();
-        filesMoved += 1;
-      }
-
-      await deps.trash(saved.id);
-      itemsTrashed += 1;
     }
+    if (itemsTrashed > 0) matchedVia = "savedItemKeys";
+  }
 
-    jobQueue.complete(payload.jobId);
+  if (itemsTrashed === 0) {
+    // No keys arrived at all, or the keyed item(s) never gained a file
+    // within budget -- fall back to duplicate matching (DOI, then
+    // PMID/arXiv, then title+year), scoped to items added since this job
+    // was handed out.
+    const found = deps.findDuplicate(original, job.enqueuedAtMs);
+    if (found) {
+      const movedForThis = await moveFileAttachments(found.item, original, deps);
+      filesMoved += movedForThis;
+      if (movedForThis > 0) {
+        await deps.trash(found.item.id);
+        itemsTrashed += 1;
+        matchedVia = `duplicateMatch:${found.rule}`;
+      }
+    }
+  }
+
+  if (itemsTrashed > 0) {
     log(
-      `POST ${RESULT_PATH} jobId=${payload.jobId} itemKey=${job.itemKey} OK: ` +
-        `filesMoved=${filesMoved} itemsTrashed=${itemsTrashed}`,
+      `${logPrefix} OK: filesMoved=${filesMoved} itemsTrashed=${itemsTrashed} (matched via ${matchedVia})`,
     );
-    return { ok: true, filesMoved, itemsTrashed };
+    return;
+  }
+
+  const reason =
+    savedKeys.length > 0
+      ? `saved, but no attachment appeared within ${Math.round(deps.attachmentWaitMs / 1000)}s`
+      : `saved, but no matching item found`;
+  log(`${logPrefix} FAILED: ${reason}`);
+}
+
+function readReconcileEnabledPref(): boolean {
+  try {
+    const value = Zotero.Prefs.get(
+      "extensions.zotero.batchopen.reconcileSavedItems",
+      true,
+    );
+    return value === undefined || value === null ? true : !!value;
+  } catch {
+    return true;
+  }
+}
+
+function readAttachmentWaitMsPref(): number {
+  try {
+    const value = Zotero.Prefs.get(
+      "extensions.zotero.batchopen.attachmentWaitMs",
+      60000,
+    );
+    return typeof value === "number" && value > 0 ? value : 60000;
+  } catch {
+    return 60000;
+  }
+}
+
+function liveFindDuplicate(
+  original: ZoteroItemLike,
+  windowStartMs: number,
+): FoundDuplicate | null {
+  try {
+    const ZoteroItems = Zotero.Items as unknown as {
+      getAll(): ZoteroItemLike[];
+    };
+    const allItems = ZoteroItems.getAll();
+    const candidates = selectCandidates(allItems, {
+      excludeIds: new Set([original.id]),
+      libraryIDs: new Set([original.libraryID]),
+      isTopLevelRegular: (item) => {
+        try {
+          return item.isRegularItem() && item.isTopLevelItem();
+        } catch {
+          return false;
+        }
+      },
+      dateAddedMs: (item) => {
+        try {
+          return parseZoteroDateAddedMs(item.getField("dateAdded"));
+        } catch {
+          return null;
+        }
+      },
+      windowStartMs,
+    });
+    const plan = planReconciliation([original], candidates);
+    if (plan.length === 0) return null;
+    return { item: plan[0].duplicate, rule: plan[0].match.rule };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    jobQueue.fail(payload.jobId, msg);
-    log(
-      `POST ${RESULT_PATH} jobId=${payload.jobId} itemKey=${job.itemKey} error applying result: ${msg}`,
-    );
-    return { ok: false, filesMoved: 0, itemsTrashed: 0, error: msg };
+    log(`findDuplicate failed: ${error}`);
+    return null;
   }
 }
 
@@ -417,6 +674,12 @@ function liveApplyResultDeps(): ApplyResultDeps {
         return 3;
       }
     })(),
+    reconcileEnabled: readReconcileEnabledPref(),
+    attachmentWaitMs: readAttachmentWaitMsPref(),
+    pollIntervalMs: 2000,
+    now: () => Date.now(),
+    sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
+    findDuplicate: liveFindDuplicate,
   };
 }
 
@@ -480,6 +743,11 @@ export interface EnqueueResult {
   skippedAlreadyQueued: number;
 }
 
+/** Injectable so tests don't hit the network; defaults to the real resolver. */
+export type RedirectResolverFn = (
+  url: string,
+) => Promise<{ finalUrl: string; hops: number; resolved: boolean }>;
+
 /**
  * For each selected regular item with no stored PDF, resolve a URL using
  * the same order as "Open all in browser" (stored url -> DOI -> first
@@ -487,16 +755,25 @@ export interface EnqueueResult {
  * a search results page) and enqueue it. Returns counts for the on-screen
  * summary.
  *
+ * When the resolved URL's host is a known redirector (doi.org,
+ * linkinghub.elsevier.com, ...; see redirectResolver.ts), follows it from
+ * Zotero's own process before enqueueing, so the browser tab this job opens
+ * lands directly on the article page rather than having to chase the chain
+ * itself. Resolution failure (network error, timeout, no known host) falls
+ * back to enqueueing the URL as originally chosen — a job is never dropped
+ * because resolution failed.
+ *
  * Deduplicates on (libraryID, itemKey): an item that already has a pending
  * or in-flight job is skipped rather than enqueued again, so re-running
  * this command on the same selection (e.g. because the connector poller
  * had not yet started) does not pile up duplicate jobs for the same item.
  */
-export function enqueueSelectedItems(
+export async function enqueueSelectedItems(
   selected: EnqueueSelectableItem[],
   itemLookup: EnqueueItemLookup,
   linkedUrlLinkMode: number,
-): EnqueueResult {
+  resolveRedirector: RedirectResolverFn = resolveRedirectorUrl,
+): Promise<EnqueueResult> {
   const { regularItems, skippedCount: skippedNotRegular } =
     splitSelection(selected);
 
@@ -539,8 +816,30 @@ export function enqueueSelectedItems(
       continue;
     }
 
+    let finalUrl = resolved.url;
+    if (isKnownRedirectorUrl(resolved.url)) {
+      try {
+        const resolution = await resolveRedirector(resolved.url);
+        if (resolution.resolved) {
+          finalUrl = resolution.finalUrl;
+          log(
+            `enqueue: resolved redirector ${resolved.url} -> ${finalUrl} ` +
+              `(${resolution.hops} hop(s)) for itemKey=${item.key}`,
+          );
+        }
+      } catch (error) {
+        // resolveRedirectorUrl itself never throws, but a caller-supplied
+        // (e.g. test) resolver might -- never drop the job over it.
+        log(
+          `enqueue: redirector resolution threw for ${resolved.url} ` +
+            `(itemKey=${item.key}): ${error}; enqueueing unresolved`,
+        );
+      }
+    }
+
     jobQueue.enqueue({
-      url: resolved.url,
+      url: finalUrl,
+      originalUrl: resolved.url,
       itemKey: item.key,
       libraryID: item.libraryID,
     });

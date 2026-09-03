@@ -14,6 +14,14 @@ export interface Job {
   enqueuedAtMs: number;
   handedOutAtMs?: number;
   error?: string;
+  /**
+   * Set when `url` is the result of resolving a known redirector host
+   * (doi.org, linkinghub.elsevier.com, etc.) at enqueue time -- the URL as
+   * originally chosen by resolveOpenUrl(), before resolution. Kept only for
+   * logging (what was enqueued vs. what it resolved to); the connector never
+   * sees this field, only the resolved `url`.
+   */
+  originalUrl?: string;
 }
 
 /** The subset of a Job the queue endpoint hands to the connector. */
@@ -59,7 +67,12 @@ export class JobQueue {
     this.idGenerator = opts.idGenerator ?? defaultIdGenerator;
   }
 
-  enqueue(job: { url: string; itemKey: string; libraryID: number }): string {
+  enqueue(job: {
+    url: string;
+    itemKey: string;
+    libraryID: number;
+    originalUrl?: string;
+  }): string {
     const jobId = this.idGenerator();
     this.jobs.set(jobId, {
       jobId,
@@ -68,6 +81,10 @@ export class JobQueue {
       libraryID: job.libraryID,
       status: "pending",
       enqueuedAtMs: this.clock.now(),
+      originalUrl:
+        job.originalUrl && job.originalUrl !== job.url
+          ? job.originalUrl
+          : undefined,
     });
     this.pendingOrder.push(jobId);
     return jobId;

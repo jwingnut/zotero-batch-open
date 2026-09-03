@@ -2,16 +2,35 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   registerEndpointsOnRegistry,
   applyResult,
+  reconcileInBackground,
   enqueueSelectedItems,
   clearConnectorQueue,
   extractMaxParam,
   jobQueue,
   QueueEndpoint,
   ResultEndpoint,
+  StatusEndpoint,
   type ApplyResultDeps,
   type ZoteroItemLike,
   type EnqueueSelectableItem,
 } from "@/services/queueServer";
+
+/** Deps with every field pre-filled for tests that only care about a few. */
+function baseDeps(overrides: Partial<ApplyResultDeps> = {}): ApplyResultDeps {
+  return {
+    items: { getByLibraryAndKey: () => false },
+    getItem: () => null,
+    trash: async () => {},
+    linkedUrlLinkMode: 3,
+    reconcileEnabled: true,
+    attachmentWaitMs: 1000,
+    pollIntervalMs: 1,
+    now: () => Date.now(),
+    sleep: async () => {},
+    findDuplicate: () => null,
+    ...overrides,
+  };
+}
 
 describe("registerEndpointsOnRegistry", () => {
   it("registers both endpoints on a plain object registry", () => {
@@ -20,6 +39,7 @@ describe("registerEndpointsOnRegistry", () => {
     expect(result.registered).toBe(true);
     expect(registry["/batchopen/queue"]).toBe(QueueEndpoint);
     expect(registry["/batchopen/result"]).toBe(ResultEndpoint);
+    expect(registry["/batchopen/status"]).toBe(StatusEndpoint);
   });
 
   it("reports failure when the registry is undefined", () => {
@@ -68,7 +88,9 @@ function makeAttachment(
     attachmentContentType: "application/pdf",
     attachmentLinkMode: 0, // imported file (not linkedUrlLinkMode=3)
     isRegularItem: () => false,
+    isTopLevelItem: () => false,
     getAttachments: () => [],
+    getField: () => "",
     saveTx: async () => {},
     ...overrides,
   };
@@ -85,7 +107,9 @@ function makeItem(
     key,
     libraryID: 1,
     isRegularItem: () => true,
+    isTopLevelItem: () => true,
     getAttachments: () => attachmentIds,
+    getField: () => "",
     saveTx: async () => {},
     ...overrides,
   };
@@ -100,15 +124,9 @@ describe("applyResult", () => {
   });
 
   it("returns ok:false for an unknown jobId", async () => {
-    const deps: ApplyResultDeps = {
-      items: { getByLibraryAndKey: () => false },
-      getItem: () => null,
-      trash: async () => {},
-      linkedUrlLinkMode: 3,
-    };
     const outcome = await applyResult(
       { jobId: "does-not-exist", ok: true, savedItemKeys: [] },
-      deps,
+      baseDeps(),
     );
     expect(outcome.ok).toBe(false);
     expect(outcome.error).toMatch(/unknown jobId/);
@@ -121,18 +139,58 @@ describe("applyResult", () => {
       libraryID: 1,
     });
     jobQueue.takeBatch(10);
-    const deps: ApplyResultDeps = {
-      items: { getByLibraryAndKey: () => false },
-      getItem: () => null,
-      trash: async () => {},
-      linkedUrlLinkMode: 3,
-    };
     const outcome = await applyResult(
       { jobId, ok: false, error: "translator not found" },
-      deps,
+      baseDeps(),
     );
     expect(outcome.ok).toBe(false);
     expect(jobQueue.get(jobId)?.status).toBe("failed");
+  });
+
+  it("completes the job immediately on a connector-reported success, before reconciliation finishes", async () => {
+    const jobId = jobQueue.enqueue({
+      url: "https://x",
+      itemKey: "ORIG1",
+      libraryID: 1,
+    });
+    jobQueue.takeBatch(10);
+    const outcome = await applyResult(
+      { jobId, ok: true, savedItemKeys: ["SAVED1"] },
+      baseDeps({ findDuplicate: () => null }),
+    );
+    expect(outcome.ok).toBe(true);
+    expect(outcome.pending).toBe(true);
+    expect(jobQueue.get(jobId)?.status).toBe("done");
+  });
+
+  it("does nothing but log when reconciliation is disabled", async () => {
+    const jobId = jobQueue.enqueue({
+      url: "https://x",
+      itemKey: "ORIG1",
+      libraryID: 1,
+    });
+    jobQueue.takeBatch(10);
+    let trashCalled = false;
+    const outcome = await applyResult(
+      { jobId, ok: true, savedItemKeys: ["SAVED1"] },
+      baseDeps({
+        reconcileEnabled: false,
+        trash: async () => {
+          trashCalled = true;
+        },
+      }),
+    );
+    expect(outcome.ok).toBe(true);
+    expect(outcome.filesMoved).toBe(0);
+    expect(outcome.pending).toBeUndefined();
+    expect(trashCalled).toBe(false);
+    expect(jobQueue.get(jobId)?.status).toBe("done");
+  });
+});
+
+describe("reconcileInBackground", () => {
+  beforeEach(() => {
+    jobQueue.clear();
   });
 
   it("moves stored file attachments from the saved item onto the original, then trashes the saved item", async () => {
@@ -142,6 +200,7 @@ describe("applyResult", () => {
       libraryID: 1,
     });
     jobQueue.takeBatch(10);
+    const job = jobQueue.get(jobId)!;
 
     const original = makeItem(100, "ORIG1", []);
     const pdfAttachment = makeAttachment(201);
@@ -163,7 +222,7 @@ describe("applyResult", () => {
     ]);
 
     const trashedIds: number[] = [];
-    const deps: ApplyResultDeps = {
+    const deps = baseDeps({
       items: {
         getByLibraryAndKey: (_lib, key) => itemsByKey.get(key) || false,
       },
@@ -171,43 +230,190 @@ describe("applyResult", () => {
       trash: async (id) => {
         trashedIds.push(id);
       },
-      linkedUrlLinkMode: 3,
-    };
+    });
 
-    const outcome = await applyResult(
+    await reconcileInBackground(
       { jobId, ok: true, savedItemKeys: ["SAVED1"] },
+      job,
       deps,
     );
 
-    expect(outcome.ok).toBe(true);
-    expect(outcome.filesMoved).toBe(1);
-    expect(outcome.itemsTrashed).toBe(1);
     expect(pdfAttachment.parentID).toBe(100);
     expect(linkAttachment.parentID).toBeUndefined();
     expect(trashedIds).toEqual([200]);
-    expect(jobQueue.get(jobId)?.status).toBe("done");
   });
 
-  it("fails gracefully (never throws) when the original item cannot be found", async () => {
+  it("waits (polling) for the attachment to appear before moving it", async () => {
+    const jobId = jobQueue.enqueue({
+      url: "https://x",
+      itemKey: "ORIG1",
+      libraryID: 1,
+    });
+    jobQueue.takeBatch(10);
+    const job = jobQueue.get(jobId)!;
+
+    const original = makeItem(100, "ORIG1", []);
+    const saved = makeItem(200, "SAVED1", []); // no attachments yet
+    let pollCount = 0;
+    const trashedIds: number[] = [];
+
+    const deps = baseDeps({
+      items: {
+        getByLibraryAndKey: (_lib, key) => {
+          if (key === "ORIG1") return original;
+          if (key === "SAVED1") return saved;
+          return false;
+        },
+      },
+      getItem: (id) => (id === 201 ? makeAttachment(201) : null),
+      trash: async (id) => {
+        trashedIds.push(id);
+      },
+      pollIntervalMs: 1,
+      attachmentWaitMs: 1000,
+      sleep: async () => {
+        pollCount += 1;
+        if (pollCount === 2) {
+          // The attachment "appears" after the second poll tick.
+          saved.getAttachments = () => [201];
+        }
+      },
+    });
+
+    await reconcileInBackground(
+      { jobId, ok: true, savedItemKeys: ["SAVED1"] },
+      job,
+      deps,
+    );
+
+    expect(trashedIds).toEqual([200]);
+    expect(pollCount).toBeGreaterThanOrEqual(2);
+  });
+
+  it("falls back to duplicate matching when no keys are reported", async () => {
+    const jobId = jobQueue.enqueue({
+      url: "https://x",
+      itemKey: "ORIG1",
+      libraryID: 1,
+    });
+    jobQueue.takeBatch(10);
+    const job = jobQueue.get(jobId)!;
+
+    const original = makeItem(100, "ORIG1", []);
+    const dupAttachment = makeAttachment(301);
+    const duplicate = makeItem(300, "DUP1", [301]);
+    const trashedIds: number[] = [];
+
+    const deps = baseDeps({
+      items: {
+        getByLibraryAndKey: (_lib, key) => (key === "ORIG1" ? original : false),
+      },
+      getItem: (id) => (id === 301 ? dupAttachment : null),
+      trash: async (id) => {
+        trashedIds.push(id);
+      },
+      findDuplicate: (orig) => {
+        expect(orig).toBe(original);
+        return { item: duplicate, rule: "doi" };
+      },
+    });
+
+    await reconcileInBackground({ jobId, ok: true, savedItemKeys: [] }, job, deps);
+
+    expect(dupAttachment.parentID).toBe(100);
+    expect(trashedIds).toEqual([300]);
+  });
+
+  it("falls back to duplicate matching when the keyed item never gains a file within budget", async () => {
+    const jobId = jobQueue.enqueue({
+      url: "https://x",
+      itemKey: "ORIG1",
+      libraryID: 1,
+    });
+    jobQueue.takeBatch(10);
+    const job = jobQueue.get(jobId)!;
+
+    const original = makeItem(100, "ORIG1", []);
+    const saved = makeItem(200, "SAVED1", []); // never gains an attachment
+    const dupAttachment = makeAttachment(301);
+    const duplicate = makeItem(300, "DUP1", [301]);
+    const trashedIds: number[] = [];
+    let now = 0;
+
+    const deps = baseDeps({
+      items: {
+        getByLibraryAndKey: (_lib, key) => {
+          if (key === "ORIG1") return original;
+          if (key === "SAVED1") return saved;
+          return false;
+        },
+      },
+      getItem: (id) => (id === 301 ? dupAttachment : null),
+      trash: async (id) => {
+        trashedIds.push(id);
+      },
+      attachmentWaitMs: 10,
+      pollIntervalMs: 5,
+      now: () => now,
+      sleep: async () => {
+        now += 5;
+      },
+      findDuplicate: () => ({ item: duplicate, rule: "title-year" }),
+    });
+
+    await reconcileInBackground(
+      { jobId, ok: true, savedItemKeys: ["SAVED1"] },
+      job,
+      deps,
+    );
+
+    expect(trashedIds).toEqual([300]);
+  });
+
+  it("logs a specific failure (never throws) when the original item cannot be found", async () => {
     const jobId = jobQueue.enqueue({
       url: "https://x",
       itemKey: "GONE",
       libraryID: 1,
     });
     jobQueue.takeBatch(10);
-    const deps: ApplyResultDeps = {
-      items: { getByLibraryAndKey: () => false },
-      getItem: () => null,
-      trash: async () => {},
-      linkedUrlLinkMode: 3,
-    };
-    const outcome = await applyResult(
-      { jobId, ok: true, savedItemKeys: ["X"] },
-      deps,
+    const job = jobQueue.get(jobId)!;
+
+    await expect(
+      reconcileInBackground(
+        { jobId, ok: true, savedItemKeys: ["X"] },
+        job,
+        baseDeps(),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("does not move anything when neither keys nor duplicate matching find a target", async () => {
+    const jobId = jobQueue.enqueue({
+      url: "https://x",
+      itemKey: "ORIG1",
+      libraryID: 1,
+    });
+    jobQueue.takeBatch(10);
+    const job = jobQueue.get(jobId)!;
+    const original = makeItem(100, "ORIG1", []);
+    let trashCalled = false;
+
+    await reconcileInBackground(
+      { jobId, ok: true, savedItemKeys: [] },
+      job,
+      baseDeps({
+        items: {
+          getByLibraryAndKey: (_lib, key) => (key === "ORIG1" ? original : false),
+        },
+        trash: async () => {
+          trashCalled = true;
+        },
+        findDuplicate: () => null,
+      }),
     );
-    expect(outcome.ok).toBe(false);
-    expect(outcome.error).toMatch(/original item not found/);
-    expect(jobQueue.get(jobId)?.status).toBe("failed");
+
+    expect(trashCalled).toBe(false);
   });
 });
 
@@ -230,17 +436,20 @@ describe("enqueueSelectedItems", () => {
     };
   }
 
-  it("enqueues items missing a stored PDF that resolve to a URL", () => {
+  it("enqueues items missing a stored PDF that resolve to a URL", async () => {
     const item = selectable("K1", {
       getField: (f) => (f === "url" ? "https://example.com/paper" : ""),
     });
-    const result = enqueueSelectedItems([item], { get: () => null }, 3);
+    const result = await enqueueSelectedItems([item], { get: () => null }, 3);
     expect(result.enqueued).toBe(1);
     expect(result.skippedHasPdf).toBe(0);
     expect(result.skippedNoUrl).toBe(0);
+    expect(jobQueue.get(jobQueue.takeBatch(1)[0].jobId)?.url).toBe(
+      "https://example.com/paper",
+    );
   });
 
-  it("skips items that already have a stored PDF", () => {
+  it("skips items that already have a stored PDF", async () => {
     const pdf: EnqueueSelectableItem = {
       isRegularItem: () => false,
       key: "ATT1",
@@ -251,19 +460,19 @@ describe("enqueueSelectedItems", () => {
       attachmentLinkMode: 0,
     };
     const item = selectable("K1", { getAttachments: () => [1] });
-    const result = enqueueSelectedItems([item], { get: () => pdf }, 3);
+    const result = await enqueueSelectedItems([item], { get: () => pdf }, 3);
     expect(result.enqueued).toBe(0);
     expect(result.skippedHasPdf).toBe(1);
   });
 
-  it("skips items with no url, DOI, or attachment url", () => {
+  it("skips items with no url, DOI, or attachment url", async () => {
     const item = selectable("K1");
-    const result = enqueueSelectedItems([item], { get: () => null }, 3);
+    const result = await enqueueSelectedItems([item], { get: () => null }, 3);
     expect(result.enqueued).toBe(0);
     expect(result.skippedNoUrl).toBe(1);
   });
 
-  it("counts non-regular items in the selection as skippedNotRegular", () => {
+  it("counts non-regular items in the selection as skippedNotRegular", async () => {
     const note: EnqueueSelectableItem = {
       isRegularItem: () => false,
       key: "N1",
@@ -271,54 +480,97 @@ describe("enqueueSelectedItems", () => {
       getField: () => "",
       getAttachments: () => [],
     };
-    const result = enqueueSelectedItems([note], { get: () => null }, 3);
+    const result = await enqueueSelectedItems([note], { get: () => null }, 3);
     expect(result.skippedNotRegular).toBe(1);
     expect(result.enqueued).toBe(0);
   });
 
-  it("resolves from DOI when no stored url is present", () => {
+  it("resolves from DOI when no stored url is present", async () => {
     const item = selectable("K1", {
       getField: (f) => (f === "DOI" ? "10.1000/xyz" : ""),
     });
-    const result = enqueueSelectedItems([item], { get: () => null }, 3);
+    const result = await enqueueSelectedItems([item], { get: () => null }, 3);
     expect(result.enqueued).toBe(1);
   });
 
-  it("skips an item that already has a pending job for the same key, and reports it", () => {
+  it("resolves a known redirector URL at enqueue time and keeps the original for logging", async () => {
+    const item = selectable("K1", {
+      getField: (f) => (f === "DOI" ? "10.1000/xyz" : ""),
+    });
+    const resolver = async (url: string) => ({
+      finalUrl: "https://publisher.example.com/article/1",
+      hops: 2,
+      resolved: true,
+    });
+    await enqueueSelectedItems([item], { get: () => null }, 3, resolver);
+    const [job] = jobQueue.takeBatch(1);
+    expect(job.url).toBe("https://publisher.example.com/article/1");
+    expect(jobQueue.get(job.jobId)?.originalUrl).toBe("https://doi.org/10.1000/xyz");
+  });
+
+  it("falls back to the unresolved URL when the redirector resolver fails to resolve", async () => {
+    const item = selectable("K1", {
+      getField: (f) => (f === "DOI" ? "10.1000/xyz" : ""),
+    });
+    const resolver = async (url: string) => ({
+      finalUrl: url,
+      hops: 0,
+      resolved: false,
+    });
+    await enqueueSelectedItems([item], { get: () => null }, 3, resolver);
+    const [job] = jobQueue.takeBatch(1);
+    expect(job.url).toBe("https://doi.org/10.1000/xyz");
+    expect(jobQueue.get(job.jobId)?.originalUrl).toBeUndefined();
+  });
+
+  it("does not attempt redirector resolution for an already-final stored URL", async () => {
     const item = selectable("K1", {
       getField: (f) => (f === "url" ? "https://example.com/paper" : ""),
     });
-    const first = enqueueSelectedItems([item], { get: () => null }, 3);
+    let resolverCalled = false;
+    const resolver = async (url: string) => {
+      resolverCalled = true;
+      return { finalUrl: url, hops: 0, resolved: false };
+    };
+    await enqueueSelectedItems([item], { get: () => null }, 3, resolver);
+    expect(resolverCalled).toBe(false);
+  });
+
+  it("skips an item that already has a pending job for the same key, and reports it", async () => {
+    const item = selectable("K1", {
+      getField: (f) => (f === "url" ? "https://example.com/paper" : ""),
+    });
+    const first = await enqueueSelectedItems([item], { get: () => null }, 3);
     expect(first.enqueued).toBe(1);
     expect(first.skippedAlreadyQueued).toBe(0);
 
-    const second = enqueueSelectedItems([item], { get: () => null }, 3);
+    const second = await enqueueSelectedItems([item], { get: () => null }, 3);
     expect(second.enqueued).toBe(0);
     expect(second.skippedAlreadyQueued).toBe(1);
     expect(jobQueue.pendingCount()).toBe(1);
   });
 
-  it("skips an item with an in-flight job for the same key", () => {
+  it("skips an item with an in-flight job for the same key", async () => {
     const item = selectable("K1", {
       getField: (f) => (f === "url" ? "https://example.com/paper" : ""),
     });
-    enqueueSelectedItems([item], { get: () => null }, 3);
+    await enqueueSelectedItems([item], { get: () => null }, 3);
     jobQueue.takeBatch(10); // move the job from pending to in-flight
 
-    const result = enqueueSelectedItems([item], { get: () => null }, 3);
+    const result = await enqueueSelectedItems([item], { get: () => null }, 3);
     expect(result.enqueued).toBe(0);
     expect(result.skippedAlreadyQueued).toBe(1);
   });
 
-  it("allows re-enqueuing an item once its prior job is done or failed", () => {
+  it("allows re-enqueuing an item once its prior job is done or failed", async () => {
     const item = selectable("K1", {
       getField: (f) => (f === "url" ? "https://example.com/paper" : ""),
     });
-    enqueueSelectedItems([item], { get: () => null }, 3);
+    await enqueueSelectedItems([item], { get: () => null }, 3);
     const [job] = jobQueue.takeBatch(10);
     jobQueue.complete(job.jobId);
 
-    const result = enqueueSelectedItems([item], { get: () => null }, 3);
+    const result = await enqueueSelectedItems([item], { get: () => null }, 3);
     expect(result.enqueued).toBe(1);
     expect(result.skippedAlreadyQueued).toBe(0);
   });
@@ -452,6 +704,26 @@ describe("QueueEndpoint", () => {
     const [status, , body] = await endpoint.init({ query: { max: "1" } });
     expect(status).toBe(200);
     expect(JSON.parse(body).jobs).toHaveLength(0);
+  });
+});
+
+describe("StatusEndpoint", () => {
+  beforeEach(() => {
+    jobQueue.clear();
+  });
+
+  it("reports pending/in-flight counts without claiming any job", async () => {
+    jobQueue.enqueue({ url: "https://a", itemKey: "A", libraryID: 1 });
+    jobQueue.enqueue({ url: "https://b", itemKey: "B", libraryID: 1 });
+    jobQueue.takeBatch(1); // one in-flight, one still pending
+
+    const endpoint = new StatusEndpoint();
+    const [status, , body] = await endpoint.init();
+    expect(status).toBe(200);
+    expect(JSON.parse(body)).toEqual({ pending: 1, inFlight: 1 });
+    // Still there -- nothing was claimed by the status check itself.
+    expect(jobQueue.pendingCount()).toBe(1);
+    expect(jobQueue.inFlightCount()).toBe(1);
   });
 });
 

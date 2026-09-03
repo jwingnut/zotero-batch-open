@@ -18,3 +18,14 @@ pref("extensions.zotero.batchopen.delayMs", 300);
 // How many minutes back to look for connector-created duplicates when
 // reconciling ("Attach newly saved files to the selected items").
 pref("extensions.zotero.batchopen.reconcileWindowMinutes", 120);
+
+// Whether "Save selected via connector" automatically reconciles: moves the
+// saved file onto the original item and trashes the new duplicate. Off
+// leaves the new item as-is for a duplicate-merging plugin (e.g. Zoplicate)
+// to handle instead. See queueServer.ts's reconcileInBackground().
+pref("extensions.zotero.batchopen.reconcileSavedItems", true);
+
+// How long (ms) reconciliation waits, polling in the background, for a
+// newly connector-saved item to gain a stored file attachment before giving
+// up and falling back to duplicate matching.
+pref("extensions.zotero.batchopen.attachmentWaitMs", 60000);
